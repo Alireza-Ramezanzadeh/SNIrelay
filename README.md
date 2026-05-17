@@ -1,7 +1,7 @@
 <h1 align="center">SNIrelay</h1>
 
 <p align="center">
-  <strong>High-performance TLS SNI &amp; HTTP transparent proxy for Rust — tunnel everything through SOCKS5 or HTTP CONNECT without terminating TLS.</strong>
+  <strong>High-performance TLS SNI &amp; HTTP transparent proxy — tunnel through SOCKS5 or HTTP CONNECT without terminating TLS.</strong>
 </p>
 
 <p align="center">
@@ -10,26 +10,27 @@
   <img src="https://img.shields.io/badge/TLS-passthrough-success" alt="TLS passthrough">
   <img src="https://img.shields.io/badge/upstream-SOCKS5%20%7C%20HTTP%20CONNECT-informational" alt="Upstream proxy">
   <img src="https://img.shields.io/badge/metrics-Prometheus-e6522c" alt="Prometheus">
+  <a href="https://hub.docker.com/r/alirezaramezanzadeh/snirelay"><img src="https://img.shields.io/docker/v/alirezaramezanzadeh/snirelay?logo=docker&label=Docker" alt="Docker image"></a>
+  <a href="https://hub.docker.com/r/alirezaramezanzadeh/snirelay"><img src="https://img.shields.io/docker/pulls/alirezaramezanzadeh/snirelay?logo=docker" alt="Docker pulls"></a>
 </p>
 
 <p align="center">
   <a href="#features">Features</a> •
-  <a href="#how-it-works">How it works</a> •
   <a href="#quick-start">Quick start</a> •
+  <a href="#docker">Docker Hub</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#observability">Observability</a> •
-  <a href="#production">Production</a> •
-  <a href="#comparison">Comparison</a>
+  <a href="#production">Production</a>
 </p>
 
 ---
 
-**SNIrelay** (Rust crate: `snirelay`) is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, routes traffic with regex rules and a static hosts table, and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
+**SNIrelay** is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, routes traffic with regex rules and a static hosts table, and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
 
 It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay end-to-end between the client and the real server.
 
-> **Why “SNIrelay”?** Short, searchable, and accurate: you *relay* connections based on *SNI*.  
-> GitHub: [`Alireza-Ramezanzadeh/SNIrelay`](https://github.com/Alireza-Ramezanzadeh/SNIrelay)
+**Repository:** [github.com/Alireza-Ramezanzadeh/SNIrelay](https://github.com/Alireza-Ramezanzadeh/SNIrelay)  
+**Docker image:** `docker.io/alirezaramezanzadeh/snirelay:0.1.0` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))
 
 ## Features
 
@@ -38,7 +39,7 @@ It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay en
 - **Upstream tunneling** — SOCKS5 (with optional auth) or HTTP `CONNECT`; `direct` mode for testing
 - **Flexible routing** — Per-listener regex routes; static `hosts:` table for IP overrides (sniproxy-style)
 - **Built for heavy traffic** — Connection limits tied to `RLIMIT_NOFILE`, listen backlog, non-blocking metrics snapshots
-- **Prometheus metrics** — Global and per-`client_ip` / `domain` / `upstream` counters; scrape-safe under load
+- **Prometheus metrics** — Global and per-`client_ip` / `domain` / `upstream` breakdown
 - **Grafana-ready** — Import [`grafana/dashboards/sniproxy-overview.json`](grafana/dashboards/sniproxy-overview.json)
 - **Docker & host network** — Smart loopback remapping for bridge vs `--network host`
 - **Graceful shutdown** — SIGINT / SIGTERM stops listeners cleanly
@@ -52,26 +53,22 @@ flowchart LR
   U -->|TCP to resolved target| O[Origin server]
 ```
 
-1. Accept TCP on a configured listener (`tls` or `http`).
-2. Peek the first bytes; extract **SNI** or **`Host`** (and port).
-3. Apply **hosts table**, then **listener routes** (`target: "*"` = use client hostname).
-4. Dial the origin **through** the upstream proxy.
-5. **Splice** bytes both ways (zero TLS termination).
-
 ## Quick start
 
 ### Docker (recommended)
 
+Published image: **`alirezaramezanzadeh/snirelay`** (`0.1.0` and `latest`).
+
 Use **host network** when the upstream proxy listens on `127.0.0.1` (typical Xray/v2ray setup):
 
 ```bash
-docker build -t snirelay:latest .
+docker pull alirezaramezanzadeh/snirelay:0.1.0
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
-  -v "$(pwd)/config/config.yaml:/etc/sniproxy/config.yaml" \
+  -v /path/to/config.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  snirelay:latest
+  alirezaramezanzadeh/snirelay:0.1.0
 ```
 
 ### From source
@@ -90,6 +87,42 @@ Override upstream at runtime:
   --proxy "socks5 127.0.0.1 10808"
 ```
 
+## Docker Hub
+
+Official image: **[`alirezaramezanzadeh/snirelay`](https://hub.docker.com/r/alirezaramezanzadeh/snirelay)**
+
+| Tag | Image | Use |
+|-----|--------|-----|
+| **`0.1.0`** | `alirezaramezanzadeh/snirelay:0.1.0` | Pinned release (recommended for production) |
+| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.1.0` after each release push |
+
+### Pull and run
+
+```bash
+docker pull alirezaramezanzadeh/snirelay:0.1.0
+
+docker run --rm -it --network host \
+  --ulimit nofile=1048576:1048576 \
+  -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -e PROXY="socks5 127.0.0.1 10808" \
+  alirezaramezanzadeh/snirelay:0.1.0
+```
+
+### Build and push (maintainers)
+
+From the repository root, after `docker login`:
+
+```bash
+export IMAGE=alirezaramezanzadeh/snirelay
+export VERSION=0.1.0
+
+docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+docker push "${IMAGE}:${VERSION}"
+docker push "${IMAGE}:latest"
+```
+
+The container runs the **`snirelay`** binary (`/usr/local/bin/snirelay`). A symlink **`pingora-sniproxy`** remains for older scripts.
+
 ## Configuration
 
 Example: [`config/config.yaml`](config/config.yaml)
@@ -104,7 +137,7 @@ Example: [`config/config.yaml`](config/config.yaml)
 | `metrics_addr` | Prometheus scrape endpoint (e.g. `:9090`) |
 | `metrics_refresh_secs` | Background `/metrics` snapshot interval |
 
-**Routing example** — send `internal.example.com` to a fixed backend; everything else uses the client SNI:
+**Routing example:**
 
 ```yaml
 listens:
@@ -118,32 +151,11 @@ listens:
         target: "*"
 ```
 
-**Hosts table** — override DNS for specific domains before routes run:
-
-```yaml
-hosts:
-  - pattern: downloads.example.com
-    address: 198.51.100.10
-  - pattern: ".*"
-    address: "*"
-```
-
 ## Observability
 
 ### Prometheus
 
-Scrape `:9090/metrics` (or your `metrics_addr`). Metrics are served from a **pre-encoded snapshot** so scrapes stay fast under heavy load.
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `sniproxy_active_connections` | Gauge | Open proxy sessions |
-| `sniproxy_connections_total` | Counter | Successful sessions |
-| `sniproxy_connection_errors_total` | Counter | Failed sessions |
-| `sniproxy_bytes_proxied_total` | Counter | Total bytes relayed |
-| `sniproxy_accepted_connections_total` | Counter | TCP accepts (by `client_ip`) |
-| `sniproxy_*_by_target_*` | Labeled | Per `client_ip`, `domain`, `upstream` |
-
-Example `prometheus.yml`:
+Scrape `:9090/metrics`. Metrics use the `sniproxy_*` prefix (unchanged for compatibility).
 
 ```yaml
 scrape_configs:
@@ -157,33 +169,26 @@ scrape_configs:
 
 ### Grafana
 
-Import the dashboard:
-
-```text
-grafana/dashboards/sniproxy-overview.json
-```
-
-Optional provisioning: [`grafana/provisioning/dashboards/dashboards.yaml`](grafana/provisioning/dashboards/dashboards.yaml)
-
-Regenerate after metric changes:
-
-```bash
-python3 grafana/gen_dashboard.py
-```
+Import: [`grafana/dashboards/sniproxy-overview.json`](grafana/dashboards/sniproxy-overview.json)
 
 ## Production
 
-**Open files** — `sysctl fs.file-max` is system-wide; each process needs a high **`ulimit -n`**:
+**Open files** — raise per-process limit, not only `sysctl fs.file-max`:
 
 ```bash
 ulimit -n 1048576
-# Docker:
-docker run --ulimit nofile=1048576:1048576 ...
+
+docker run -d --name snirelay --restart unless-stopped \
+  --network host \
+  --ulimit nofile=1048576:1048576 \
+  -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -e PROXY="socks5 127.0.0.1 10808" \
+  alirezaramezanzadeh/snirelay:0.1.0
 ```
 
-**Upstream on localhost** — With Xray on `127.0.0.1:10808`, run SNIrelay with `--network host` or bind Xray to `0.0.0.0` when using bridge networking.
+**Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.
 
-**Config tuning** for ~40–100+ Mbit/s and many concurrent clients:
+**Heavy traffic tuning:**
 
 ```yaml
 nofile_limit: 1048576
@@ -192,46 +197,32 @@ listen_backlog: 4096
 metrics_refresh_secs: 2
 ```
 
-Startup logs show the effective connection cap:
-
-```text
-Process open-file soft limit: 1048576; max concurrent proxy sessions: 50000
-```
-
 ## Comparison
 
 | | **SNIrelay** | Classic sniproxy | nginx stream |
 |--|--------------|------------------|--------------|
-| TLS termination | No (passthrough) | No | Optional |
+| TLS termination | No | No | Optional |
 | SOCKS5 upstream | Yes | Via external tools | Limited |
 | HTTP CONNECT upstream | Yes | Via external tools | No |
 | Per-client Prometheus labels | Yes | No | Limited |
 | Rust / single static binary | Yes | C | C |
-| Heavy-load metrics | Snapshot scrape | N/A | Varies |
 
 ## Project layout
 
 ```text
-├── src/              # Proxy core (SNI parse, splice, routing)
+├── src/              # Proxy core
 ├── config/           # Example YAML
-├── grafana/          # Dashboard + generator
+├── grafana/          # Dashboard + alerts
 ├── Dockerfile
 └── docker-entrypoint.sh
 ```
 
-## Contributing
-
-Issues and pull requests are welcome. Please include:
-
-- What you changed and why
-- How you tested (e.g. `cargo test`, Docker smoke test)
-
 ## License
 
-[MIT](LICENSE) — use freely in commercial and personal projects.
+[MIT](LICENSE)
 
 ---
 
 <p align="center">
-  If SNIrelay saves you time, consider giving the repo a ⭐ — it helps others find it.
+  If SNIrelay helps you, consider giving the repo a ⭐ on GitHub.
 </p>
