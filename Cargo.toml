@@ -1,0 +1,41 @@
+[package]
+name = "pingora-sniproxy"
+version = "0.0.13"
+edition = "2021"
+description = "SNIrelay — high-performance TLS SNI & HTTP transparent proxy with SOCKS5/HTTP CONNECT upstream (L4 passthrough)"
+authors = ["Alireza Ramezanzadeh"]
+repository = "https://github.com/Alireza-Ramezanzadeh/SNIrelay"
+keywords = ["sni", "proxy", "tls", "socks5", "transparent-proxy", "prometheus"]
+license = "MIT"
+
+[[bin]]
+name = "pingora-sniproxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime (self-contained — no Pingora runtime dependency needed
+# for the pure-L4 splice approach; Pingora is pulled for future integration)
+tokio = { version = "1", features = ["full"] }
+
+# Config & CLI
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging & metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+prometheus = "0.13"
+
+# Utilities
+anyhow = "1"
+once_cell = "1"
+regex = "1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

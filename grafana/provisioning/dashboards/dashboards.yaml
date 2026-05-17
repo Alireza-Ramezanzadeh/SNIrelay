@@ -1,0 +1,15 @@
+# Mount this folder into Grafana, e.g.:
+#   -v ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+#   -v ./grafana/dashboards:/var/lib/grafana/dashboards
+apiVersion: 1
+
+providers:
+  - name: pingora-sniproxy
+    orgId: 1
+    folder: SNI Proxy
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

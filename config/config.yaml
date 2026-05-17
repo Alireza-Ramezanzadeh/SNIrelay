@@ -1,0 +1,113 @@
+# pingora-sniproxy configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Upstream proxy ────────────────────────────────────────────────────────────
+# Supported types: socks5, http, direct
+# Mirrors the PROXY env var format: "<type> <host> <port>"
+# Override at runtime:  -e PROXY="socks5 127.0.0.1 10808"
+upstream_proxy:
+  type: socks5
+  host: "127.0.0.1"
+  port: 10808
+  # Optional SOCKS5 credentials:
+  # username: "user"
+  # password: "secret"
+
+# ── Listen sockets (TLS + HTTP) ───────────────────────────────────────────────
+# Define any number of TLS (SNI) and HTTP (Host header) listeners in one list.
+# proto: tls | http  (optional — inferred from port: 80/8080 → http, else tls)
+listens:
+  - name: https
+    addr: "0.0.0.0:443"
+    proto: tls
+    routes:
+      - pattern: ".*"
+        target: "*"
+
+  - name: https-alt
+    addr: "0.0.0.0:8443"
+    proto: tls
+    routes:
+      - pattern: ".*"
+        target: "*"
+
+  - name: http
+    addr: "0.0.0.0:80"
+    proto: http
+    routes:
+      - pattern: ".*"
+        target: "*"
+
+  # proto omitted → inferred as http from port 8080
+  - name: http-alt
+    addr: "0.0.0.0:8080"
+    routes:
+      - pattern: ".*"
+        target: "*"
+
+  - name: https-limooagent
+    addr: "0.0.0.0:7081"
+    proto: tls
+    routes:
+      - pattern: ".*"
+        target: "*"
+
+
+  # ─── Per-listener routing examples ───
+  # - name: internal-https
+  #   addr: "127.0.0.1:9443"
+  #   proto: tls
+  #   routes:
+  #     - pattern: "^internal\\.example\\.com$"
+  #       target: "192.168.1.10:8443"
+  #     - pattern: ".*"
+  #       target: "*"
+
+# ── Legacy (optional): split TLS / HTTP lists ─────────────────────────────────
+# Used only when `listens` is empty or omitted.
+# tls_listen:
+#   - addr: "0.0.0.0:443"
+#     proto: tls
+#     routes:
+#       - pattern: ".*"
+#         target: "*"
+# http_listen:
+#   - addr: "0.0.0.0:80"
+#     proto: http
+#     routes:
+#       - pattern: ".*"
+#         target: "*"
+
+# ── Hosts table (static DNS overrides) ────────────────────────────────────────
+# Maps client SNI/Host → backend IP for the upstream SOCKS tunnel.
+# address: "*" = use the hostname from the client. First match wins.
+hosts:
+  - pattern: translate.wordpress.com
+    address: 192.0.78.12
+  - pattern: eu.taline.ir
+    address: 91.107.161.221
+  - pattern: bimemosaferati.com
+    address: 95.156.253.59
+  - pattern: downloads.wordpress.org
+    address: 198.143.164.250
+  - pattern: ".*"
+    address: "*"
+
+# ── Timeouts ──────────────────────────────────────────────────────────────────
+connect_timeout_secs: 10
+rw_timeout_secs: 300
+
+# ── Performance ───────────────────────────────────────────────────────────────
+# 0 = auto-detect (number of logical CPUs)
+workers: 0
+# Raise process RLIMIT_NOFILE at startup (also set host/container ulimit).
+nofile_limit: 1048576
+# Upper bound; capped at ~(nofile_limit - 128) / 2 (two sockets per session).
+max_connections: 50000
+listen_backlog: 4096
+
+# ── Observability (Prometheus) ────────────────────────────────────────────────
+# Labels: client_ip (input), domain (SNI/Host), upstream (tunnel target)
+# /metrics is served from a pre-built snapshot (no gather on scrape); tune interval under heavy load.
+metrics_addr: "0.0.0.0:9090"
+metrics_refresh_secs: 2

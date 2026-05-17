@@ -1,0 +1,44 @@
+# Optional Prometheus alerting rules (add to prometheus.yml rule_files).
+groups:
+  - name: sniproxy
+    rules:
+      - alert: SniproxyTargetDown
+        expr: up{job="sniproxy"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SNI proxy metrics target down"
+          description: "Prometheus cannot scrape {{ $labels.instance }} (job {{ $labels.job }})."
+
+      - alert: SniproxyHighErrorRate
+        expr: |
+          100 * rate(sniproxy_connection_errors_total{job="sniproxy"}[5m])
+          / clamp_min(sum(rate(sniproxy_accepted_connections_total{job="sniproxy"}[5m])), 1e-9)
+          > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SNI proxy error rate above 5%"
+          description: "Error rate is {{ $value | printf \"%.1f\" }}% on {{ $labels.instance }}."
+
+      - alert: SniproxyHighActiveConnections
+        expr: sniproxy_active_connections{job="sniproxy"} > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SNI proxy high active connection count"
+          description: "{{ $value }} active connections on {{ $labels.instance }}."
+
+      - alert: SniproxyNoTraffic
+        expr: |
+          sum(rate(sniproxy_accepted_connections_total{job="sniproxy"}[15m])) == 0
+          and up{job="sniproxy"} == 1
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "SNI proxy accepting no connections"
+          description: "No accepted connections for 30m while target is up."
