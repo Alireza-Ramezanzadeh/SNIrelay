@@ -1,9 +1,8 @@
 // =============================================================================
-// pingora-sniproxy — SNI-aware transparent proxy built on Cloudflare Pingora
-// with upstream HTTP CONNECT / SOCKS5 proxy support.
+// SNIrelay — SNI-aware transparent L4 proxy with upstream HTTP CONNECT / SOCKS5 support.
 //
 // Architecture:
-//   Client ──TLS/HTTP──► [pingora-sniproxy] ──SOCKS5/HTTP-CONNECT──► [upstream proxy] ──► Origin
+//   Client ──TLS/HTTP──► [SNIrelay] ──SOCKS5/HTTP-CONNECT──► [upstream proxy] ──► Origin
 //
 // The proxy NEVER terminates TLS.  It reads only the SNI extension from the
 // ClientHello (or the Host header for plain HTTP) and blindly forwards the
@@ -28,9 +27,9 @@ use tracing_subscriber::EnvFilter;
 use crate::config::AppConfig;
 use crate::service::SniProxyService;
 
-/// Pingora-based SNI proxy with upstream SOCKS5 / HTTP CONNECT support
+/// SNIrelay — transparent SNI/Host proxy with SOCKS5 / HTTP CONNECT upstream
 #[derive(Parser, Debug)]
-#[command(name = "pingora-sniproxy", version, about)]
+#[command(name = "snirelay", version, about)]
 struct Cli {
     /// Path to YAML configuration file
     #[arg(short, long, default_value = "/etc/sniproxy/config.yaml")]
@@ -73,7 +72,7 @@ async fn main() -> Result<()> {
 
     cfg.remap_docker_loopback_upstream();
 
-    info!("Starting pingora-sniproxy v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting SNIrelay v{}", env!("CARGO_PKG_VERSION"));
     info!("Upstream proxy: {:?}", cfg.upstream_proxy);
     for listener in &cfg.listens {
         info!(

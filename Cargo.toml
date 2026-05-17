@@ -1,6 +1,6 @@
 [package]
-name = "pingora-sniproxy"
-version = "0.0.13"
+name = "snirelay"
+version = "0.1.0"
 edition = "2021"
 description = "SNIrelay — high-performance TLS SNI & HTTP transparent proxy with SOCKS5/HTTP CONNECT upstream (L4 passthrough)"
 authors = ["Alireza Ramezanzadeh"]
@@ -9,12 +9,11 @@ keywords = ["sni", "proxy", "tls", "socks5", "transparent-proxy", "prometheus"]
 license = "MIT"
 
 [[bin]]
-name = "pingora-sniproxy"
+name = "snirelay"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime (self-contained — no Pingora runtime dependency needed
-# for the pure-L4 splice approach; Pingora is pulled for future integration)
+# Async runtime (Tokio L4 splice — no TLS termination)
 tokio = { version = "1", features = ["full"] }
 
 # Config & CLI

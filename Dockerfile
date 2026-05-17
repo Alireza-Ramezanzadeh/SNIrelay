@@ -6,7 +6,7 @@ FROM rust:1.85-bookworm AS builder
 
 WORKDIR /build
 
-# Install build dependencies for Pingora (needs clang + perl for BoringSSL/OpenSSL)
+# Build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     perl \
@@ -42,8 +42,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Create non-root user
 RUN groupadd -r sniproxy && useradd -r -g sniproxy -s /usr/sbin/nologin sniproxy
 
-COPY --from=builder /build/target/release/pingora-sniproxy /usr/local/bin/pingora-sniproxy
-RUN chmod +x /usr/local/bin/pingora-sniproxy
+COPY --from=builder /build/target/release/snirelay /usr/local/bin/snirelay
+RUN chmod +x /usr/local/bin/snirelay \
+    && ln -sf /usr/local/bin/snirelay /usr/local/bin/pingora-sniproxy
 
 # Default config directory (mount a volume here)
 RUN mkdir -p /etc/sniproxy && chown sniproxy:sniproxy /etc/sniproxy

@@ -8,7 +8,7 @@ set -e
 
 # Docker CMD used to pass the binary name; ignore it if present.
 case "$1" in
-    pingora-sniproxy|/usr/local/bin/pingora-sniproxy) shift ;;
+    snirelay|pingora-sniproxy|/usr/local/bin/snirelay|/usr/local/bin/pingora-sniproxy) shift ;;
 esac
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/sniproxy/config.yaml}"
@@ -78,9 +78,9 @@ fi
 
 if [ -n "${PROXY}" ]; then
     echo "[entrypoint] Using upstream proxy: ${PROXY}"
-    echo "[entrypoint] Starting: pingora-sniproxy --config ${CONFIG_FILE} --log-level ${LOG_LEVEL} --proxy ${PROXY}"
-    exec pingora-sniproxy --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" --proxy "${PROXY}" "$@"
+    echo "[entrypoint] Starting: snirelay --config ${CONFIG_FILE} --log-level ${LOG_LEVEL} --proxy ${PROXY}"
+    exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" --proxy "${PROXY}" "$@"
 fi
 
-echo "[entrypoint] Starting: pingora-sniproxy --config ${CONFIG_FILE} --log-level ${LOG_LEVEL}"
-exec pingora-sniproxy --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" "$@"
+echo "[entrypoint] Starting: snirelay --config ${CONFIG_FILE} --log-level ${LOG_LEVEL}"
+exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" "$@"

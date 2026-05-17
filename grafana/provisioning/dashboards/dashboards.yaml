@@ -4,7 +4,7 @@
 apiVersion: 1
 
 providers:
-  - name: pingora-sniproxy
+  - name: snirelay
     orgId: 1
     folder: SNI Proxy
     type: file

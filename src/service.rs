@@ -1,4 +1,4 @@
-// service.rs — Pingora-based SNI proxy service
+// service.rs — SNIrelay proxy service
 //
 // For each incoming TCP connection we:
 //   1. Peek at the first bytes without consuming them

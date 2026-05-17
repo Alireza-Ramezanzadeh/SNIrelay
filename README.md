@@ -24,7 +24,7 @@
 
 ---
 
-**SNIrelay** (Rust crate: `pingora-sniproxy`) is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, routes traffic with regex rules and a static hosts table, and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
+**SNIrelay** (Rust crate: `snirelay`) is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, routes traffic with regex rules and a static hosts table, and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
 
 It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay end-to-end between the client and the real server.
 
@@ -79,13 +79,13 @@ docker run --rm -it --network host \
 ```bash
 # Rust 1.85+ required
 cargo build --release
-./target/release/pingora-sniproxy --config config/config.yaml
+./target/release/snirelay --config config/config.yaml
 ```
 
 Override upstream at runtime:
 
 ```bash
-./target/release/pingora-sniproxy \
+./target/release/snirelay \
   --config config/config.yaml \
   --proxy "socks5 127.0.0.1 10808"
 ```
