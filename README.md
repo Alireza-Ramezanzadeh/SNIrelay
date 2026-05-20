@@ -171,6 +171,10 @@ scrape_configs:
 
 Import: [`grafana/dashboards/sniproxy-overview.json`](grafana/dashboards/sniproxy-overview.json)
 
+The top row **Selected time range (totals)** shows bytes transferred (total, upload, download) and **sessions opened** over whatever period you pick in the time picker, using `increase(...[$__range])` on the `*_by_target_*` metrics so the **Domain** dropdown filters these panels (global `sniproxy_bytes_proxied_total` / `sniproxy_connections_total` have no domain label).
+
+Regenerate the JSON after editing queries: `python3 grafana/gen_dashboard.py`.
+
 ## Production
 
 **Open files** — raise per-process limit, not only `sysctl fs.file-max`:
@@ -216,6 +220,10 @@ metrics_refresh_secs: 2
 ├── Dockerfile
 └── docker-entrypoint.sh
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, PR expectations, and how to regenerate the Grafana dashboard.
 
 ## License
 

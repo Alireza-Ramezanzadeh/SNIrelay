@@ -97,9 +97,80 @@ def row_panel(pid, title, y):
     }
 
 
+def stat_panel_range(pid, title, expr, x, y, w, h, unit="short"):
+    """Single-value stats for the dashboard time picker (Grafana $__range)."""
+    return {
+        "id": pid,
+        "type": "stat",
+        "title": title,
+        "gridPos": {"x": x, "y": y, "w": w, "h": h},
+        "datasource": DS,
+        "targets": [prom(expr, instant=True)],
+        "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+        },
+        "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+        "description": "Totals for the dashboard time range and Domain variable. Uses increase() over $__range with domain=~\"$domain\" (All → .*).",
+    }
+
+
 def main():
     p = []
     y = 0
+
+    p.append(row_panel(98, "Selected time range (totals)", y))
+    y += 1
+    p += [
+        stat_panel_range(
+            96,
+            "Total data transferred",
+            "sum(increase(sniproxy_bytes_proxied_by_target_total{%s}[$__range]))" % FV,
+            0,
+            y,
+            6,
+            4,
+            unit="bytes",
+        ),
+        stat_panel_range(
+            95,
+            "Upload (client → upstream)",
+            (
+                'sum(increase(sniproxy_bytes_proxied_by_target_total{%s,direction="client_to_upstream"}[$__range]))'
+                % FV
+            ),
+            6,
+            y,
+            6,
+            4,
+            unit="bytes",
+        ),
+        stat_panel_range(
+            94,
+            "Download (upstream → client)",
+            (
+                'sum(increase(sniproxy_bytes_proxied_by_target_total{%s,direction="upstream_to_client"}[$__range]))'
+                % FV
+            ),
+            12,
+            y,
+            6,
+            4,
+            unit="bytes",
+        ),
+        stat_panel_range(
+            93,
+            "Sessions opened (requests)",
+            "sum(increase(sniproxy_connections_by_target_total{%s}[$__range]))" % FV,
+            18,
+            y,
+            6,
+            4,
+            unit="short",
+        ),
+    ]
+    y += 4
 
     p.append(row_panel(100, "Overview", y))
     y += 1
