@@ -1,6 +1,6 @@
 [package]
 name = "snirelay"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "SNIrelay — high-performance TLS SNI & HTTP transparent proxy with SOCKS5/HTTP CONNECT upstream (L4 passthrough)"
 authors = ["Alireza Ramezanzadeh"]

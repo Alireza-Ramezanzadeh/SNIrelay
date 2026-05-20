@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::time::timeout;
@@ -626,6 +626,33 @@ fn parse_host_port(s: &str, default_port: u16) -> (String, u16) {
 
 // ── Bidirectional splice ──────────────────────────────────────────────────────
 
+const SPLICE_BUF_SIZE: usize = 64 * 1024;
+
+/// Copy all readable data from `reader` into `writer`, counting bytes **successfully
+/// written** per chunk. Unlike `tokio::io::copy`, if the peer aborts (RST / broken pipe)
+/// after part of the transfer, completed chunks still contribute to the total — so metrics
+/// match partial downloads (e.g. Ctrl+C on `wget`).
+async fn copy_counting<R, W>(mut reader: R, mut writer: W) -> u64
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; SPLICE_BUF_SIZE];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        match writer.write_all(&buf[..n]).await {
+            Ok(()) => total += n as u64,
+            Err(_) => break,
+        }
+    }
+    total
+}
+
 /// Copy bytes between client and upstream in both directions concurrently.
 /// Returns (client_to_upstream_bytes, upstream_to_client_bytes).
 async fn splice(
@@ -636,19 +663,9 @@ async fn splice(
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut ur, mut uw) = tokio::io::split(upstream);
 
-    let c2u = tokio::spawn(async move {
-        match tokio::io::copy(&mut cr, &mut uw).await {
-            Ok(n) => n,
-            Err(_) => 0,
-        }
-    });
+    let c2u = tokio::spawn(async move { copy_counting(&mut cr, &mut uw).await });
 
-    let u2c = tokio::spawn(async move {
-        match tokio::io::copy(&mut ur, &mut cw).await {
-            Ok(n) => n,
-            Err(_) => 0,
-        }
-    });
+    let u2c = tokio::spawn(async move { copy_counting(&mut ur, &mut cw).await });
 
     let c2u_bytes = c2u.await.unwrap_or(0);
     let u2c_bytes = u2c.await.unwrap_or(0);
