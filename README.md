@@ -96,19 +96,19 @@ Official image: **[`alirezaramezanzadeh/snirelay`](https://hub.docker.com/r/alir
 
 | Tag | Image | Use |
 |-----|--------|-----|
-| **`0.1.0`** | `alirezaramezanzadeh/snirelay:0.1.0` | Pinned release (recommended for production) |
-| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.1.0` after each release push |
+| **`0.1.1`** | `alirezaramezanzadeh/snirelay:0.1.1` | Pinned release (recommended for production) |
+| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.1.1` after each release push |
 
 ### Pull and run
 
 ```bash
-docker pull alirezaramezanzadeh/snirelay:0.1.0
+docker pull alirezaramezanzadeh/snirelay:0.1.1
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.0
+  alirezaramezanzadeh/snirelay:0.1.1
 ```
 
 ### Build and push (maintainers)
@@ -117,7 +117,7 @@ From the repository root, after `docker login`:
 
 ```bash
 export IMAGE=alirezaramezanzadeh/snirelay
-export VERSION=0.1.0
+export VERSION=0.1.1
 
 docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
 docker push "${IMAGE}:${VERSION}"
@@ -190,7 +190,7 @@ docker run -d --name snirelay --restart unless-stopped \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.0
+  alirezaramezanzadeh/snirelay:0.1.1
 ```
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.
