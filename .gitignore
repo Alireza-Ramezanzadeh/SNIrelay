@@ -20,4 +20,4 @@ config/*.local.yaml
 *.profraw
 *.tar.gz
 *.zip
-cpmove-*.tar.gz
+

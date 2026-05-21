@@ -30,7 +30,8 @@
 It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay end-to-end between the client and the real server.
 
 **Repository:** [github.com/Alireza-Ramezanzadeh/SNIrelay](https://github.com/Alireza-Ramezanzadeh/SNIrelay)  
-**Docker image:** `docker.io/alirezaramezanzadeh/snirelay:0.1.0` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))
+**Docker Hub:** `docker.io/alirezaramezanzadeh/snirelay:0.1.1` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))  
+**GitHub Packages:** `ghcr.io/alireza-ramezanzadeh/snirelay:0.1.1` ([GitHub Packages](https://github.com/Alireza-Ramezanzadeh/SNIrelay/pkgs/container/snirelay))
 
 ## Features
 
@@ -57,18 +58,20 @@ flowchart LR
 
 ### Docker (recommended)
 
-Published image: **`alirezaramezanzadeh/snirelay`** (`0.1.0` and `latest`).
-
-Use **host network** when the upstream proxy listens on `127.0.0.1` (typical Xray/v2ray setup):
+Images are published to both **Docker Hub** and **GitHub Packages**. Use **host network** when the upstream proxy listens on `127.0.0.1` (typical Xray/v2ray setup):
 
 ```bash
-docker pull alirezaramezanzadeh/snirelay:0.1.0
+# Docker Hub
+docker pull alirezaramezanzadeh/snirelay:0.1.1
+
+# GitHub Packages
+docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.1.1
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
   -v /path/to/config.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.0
+  alirezaramezanzadeh/snirelay:0.1.1
 ```
 
 ### From source
