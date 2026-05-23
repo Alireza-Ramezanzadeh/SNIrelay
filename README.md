@@ -25,20 +25,20 @@
 
 ---
 
-**SNIrelay** is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, routes traffic with regex rules and a static hosts table, and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
+**SNIrelay** is a layer-4 reverse proxy that reads the **TLS SNI** hostname or **HTTP `Host`** header, matches against a **`hosts`** allowlist (with optional DNS overrides), and forwards **raw bytes** to the origin through an upstream **SOCKS5** or **HTTP CONNECT** proxy (Xray, v2ray, Dante, Squid, etc.).
 
 It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay end-to-end between the client and the real server.
 
 **Repository:** [github.com/Alireza-Ramezanzadeh/SNIrelay](https://github.com/Alireza-Ramezanzadeh/SNIrelay)  
-**Docker Hub:** `docker.io/alirezaramezanzadeh/snirelay:0.2.0` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))  
-**GitHub Packages:** `ghcr.io/alireza-ramezanzadeh/snirelay:0.2.0` ([GitHub Packages](https://github.com/Alireza-Ramezanzadeh/SNIrelay/pkgs/container/snirelay))
+**Docker Hub:** `docker.io/alirezaramezanzadeh/snirelay:0.2.2` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))  
+**GitHub Packages:** `ghcr.io/alireza-ramezanzadeh/snirelay:0.2.2` ([GitHub Packages](https://github.com/Alireza-Ramezanzadeh/SNIrelay/pkgs/container/snirelay))
 
 ## Features
 
 - **TLS passthrough** — Parse SNI from `ClientHello` only; replay the exact handshake bytes upstream
 - **HTTP & HTTPS** — Multiple listeners (443, 80, 8080, custom ports) in one config file
 - **Upstream tunneling** — SOCKS5 (with optional auth) or HTTP `CONNECT`; `direct` mode for testing
-- **Flexible routing** — Per-listener regex routes; static `hosts:` table for IP overrides (sniproxy-style)
+- **Hosts allowlist** — Sniproxy-style `table hosts`: which domains may relay + optional IP override
 - **Built for heavy traffic** — Connection limits tied to `RLIMIT_NOFILE`, listen backlog, non-blocking metrics snapshots
 - **Prometheus metrics** — Global and per-`client_ip` / `domain` / `upstream` breakdown
 - **Grafana-ready** — Import [`grafana/dashboards/sniproxy-overview.json`](grafana/dashboards/sniproxy-overview.json)
@@ -63,17 +63,17 @@ Images are published to both **Docker Hub** and **GitHub Packages**. Use **host 
 
 ```bash
 # Docker Hub
-docker pull alirezaramezanzadeh/snirelay:0.2.0
+docker pull alirezaramezanzadeh/snirelay:0.2.2
 
 # GitHub Packages
-docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.2.0
+docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.2.2
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
   -v /path/to/config.yaml:/etc/sniproxy/config.yaml \
   -v snirelay-data:/var/lib/snirelay \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.2.0
+  alirezaramezanzadeh/snirelay:0.2.2
 ```
 
 ### From source
@@ -98,20 +98,20 @@ Official image: **[`alirezaramezanzadeh/snirelay`](https://hub.docker.com/r/alir
 
 | Tag | Image | Use |
 |-----|--------|-----|
-| **`0.2.0`** | `alirezaramezanzadeh/snirelay:0.2.0` | Pinned release (recommended for production) |
-| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.2.0` after each release push |
+| **`0.2.2`** | `alirezaramezanzadeh/snirelay:0.2.2` | Pinned release (recommended for production) |
+| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.2.2` after each release push |
 
 ### Pull and run
 
 ```bash
-docker pull alirezaramezanzadeh/snirelay:0.2.0
+docker pull alirezaramezanzadeh/snirelay:0.2.2
 
-docker run --rm -it --network host \
+docker run -d --restart always  --network host \
   --ulimit nofile=1048576:1048576 \
-  -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
-  -v snirelay-data:/var/lib/snirelay \
-  -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.2.0
+  -v $(pwd)/snirelay/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -v $(pwd)/snirelay:/var/lib/snirelay  \
+  --name snirelay \
+  alirezaramezanzadeh/snirelay:0.2.2
 ```
 
 ### Build and push (maintainers)
@@ -119,16 +119,16 @@ docker run --rm -it --network host \
 **GitHub Actions (recommended):** push a version tag and the workflow publishes images:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
-This builds and pushes `ghcr.io/<owner>/snirelay:0.2.0` and `:latest`. For Docker Hub, add repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (see [`.github/workflows/release-docker.yml`](.github/workflows/release-docker.yml)).
+This builds and pushes `ghcr.io/<owner>/snirelay:0.2.2` and `:latest`. For Docker Hub, add repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (see [`.github/workflows/release-docker.yml`](.github/workflows/release-docker.yml)).
 
 **Manual push** (after `docker login`):
 
 ```bash
-export VERSION=0.2.0
+export VERSION=0.2.2
 export IMAGE=alirezaramezanzadeh/snirelay
 export GHCR=ghcr.io/alireza-ramezanzadeh/snirelay
 
@@ -147,25 +147,29 @@ Example: [`config/config.yaml`](config/config.yaml)
 | Section | Purpose |
 |--------|---------|
 | `upstream_proxy` | SOCKS5, HTTP CONNECT, or `direct` |
-| `listens` | Bind addresses, `proto: tls \| http`, per-listener `routes` |
-| `hosts` | Static hostname → IP map (`address: "*"` = passthrough) |
+| `listens` | Bind addresses and `proto: tls \| http` |
+| `hosts` | Allowlist (regex patterns) + DNS/IP (`address: "*"` = use client hostname) |
 | `max_connections` | Concurrent sessions (capped from open-file limit) |
 | `nofile_limit` | Raise `RLIMIT_NOFILE` at startup |
 | `metrics_addr` | Prometheus scrape endpoint (e.g. `:9090`) |
 | `metrics_refresh_secs` | Background `/metrics` snapshot interval |
 
-**Routing example:**
+**Hosts example:**
 
 ```yaml
 listens:
   - name: public-https
     addr: "0.0.0.0:443"
     proto: tls
-    routes:
-      - pattern: "^internal\\.example\\.com$"
-        target: "10.0.0.5:443"
-      - pattern: ".*"
-        target: "*"
+
+hosts:
+  - pattern: ".*\\.example\\.com"
+    address: "*"
+  - pattern: "cdn.example.com"
+    address: "203.0.113.10"
+  # Allow all domains (open proxy):
+  # - pattern: ".*"
+  #   address: "*"
 ```
 
 ## Observability
@@ -204,7 +208,7 @@ docker run -d --name snirelay --restart unless-stopped \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.2.0
+  alirezaramezanzadeh/snirelay:0.2.2
 ```
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.

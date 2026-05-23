@@ -62,6 +62,7 @@ Fix any new warnings from `clippy` unless there is a strong reason to suppress t
 - **Keep hot paths lean** — Avoid extra allocations or blocking work on the Tokio runtime in per-connection paths. Heavy work belongs on `spawn_blocking` or background tasks (see metrics snapshot pattern).
 - **TLS passthrough** — Do not add TLS termination in the default path. Changes that parse more of the handshake must preserve correct replay to the upstream.
 - **Compatibility** — Prometheus metrics intentionally keep the `sniproxy_*` prefix and label sets for existing dashboards. If you rename or remove a metric, document it in the PR and update `grafana/gen_dashboard.py` + `README.md` as needed.
+- **Config** — Routing is **`hosts` only**; do not add per-listener `routes` (ignored with a warning). See [`config/config.limoo.yaml`](config/config.limoo.yaml) for a production-style example.
 
 ## Configuration and docs
 

@@ -3,7 +3,7 @@
 // For each incoming TCP connection we:
 //   1. Peek at the first bytes without consuming them
 //   2. Extract SNI (TLS) or Host header (HTTP)
-//   3. Match against routing table
+//   3. Match against hosts table (allowlist + DNS)
 //   4. Dial the upstream proxy tunnel to the origin
 //   5. Splice bytes bidirectionally — zero-copy where possible
 //
@@ -19,47 +19,13 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
-use regex::Regex;
 
-use crate::config::{AppConfig, RouteEntry};
+use crate::config::AppConfig;
 use crate::domain_limiter::DomainLimiter;
 use crate::hosts::{HostResolve, HostsTable};
 use crate::metrics::{self, TargetLabels};
 use crate::proxy_connector;
 use crate::sni::{self, PeekResult};
-
-// ── Route table (compiled regexes) ───────────────────────────────────────────
-
-struct CompiledRoute {
-    pattern: Regex,
-    target: String,
-}
-
-struct RouteTable {
-    routes: Vec<CompiledRoute>,
-}
-
-impl RouteTable {
-    fn compile(routes: &[RouteEntry]) -> Result<Self> {
-        let compiled = routes.iter().map(|r| {
-            let pattern = Regex::new(&r.pattern)
-                .with_context(|| format!("Invalid route regex: '{}'", r.pattern))?;
-            Ok(CompiledRoute { pattern, target: r.target.clone() })
-        }).collect::<Result<Vec<_>>>()?;
-        Ok(RouteTable { routes: compiled })
-    }
-
-    /// Returns the target for a given hostname.
-    /// Target "*" means "use the hostname as-is".
-    fn resolve(&self, hostname: &str) -> Option<&str> {
-        for route in &self.routes {
-            if route.pattern.is_match(hostname) {
-                return Some(&route.target);
-            }
-        }
-        None
-    }
-}
 
 // ── Top-level service ─────────────────────────────────────────────────────────
 
@@ -124,7 +90,6 @@ impl SniProxyService {
         let mut handles = Vec::new();
 
         for listener_cfg in &cfg.listens {
-            let routes = Arc::new(RouteTable::compile(&listener_cfg.routes)?);
             let cfg2 = cfg.clone();
             let laddr = listener_cfg.addr.clone();
             let proto = listener_cfg.proto_str().to_string();
@@ -132,7 +97,6 @@ impl SniProxyService {
             let listen_port = listener_cfg
                 .listen_port()
                 .with_context(|| format!("listener [{}]", listener_cfg.label()))?;
-            let routes2 = routes.clone();
             let shutdown_rx = shutdown_rx.clone();
             let slots = connection_slots.clone();
             let backlog = cfg.listen_backlog;
@@ -144,7 +108,6 @@ impl SniProxyService {
                     proto,
                     label,
                     listen_port,
-                    routes2,
                     cfg2,
                     shutdown_rx,
                     slots,
@@ -262,7 +225,6 @@ async fn run_listener(
     proto: String,
     label: String,
     listen_port: u16,
-    routes: Arc<RouteTable>,
     cfg: Arc<AppConfig>,
     mut shutdown_rx: watch::Receiver<bool>,
     connection_slots: Arc<Semaphore>,
@@ -297,7 +259,6 @@ async fn run_listener(
                     Ok((stream, peer)) => {
                         debug!("New connection from {peer}");
                         metrics::connection_accepted(&peer.to_string());
-                        let routes2 = routes.clone();
                         let cfg2 = cfg.clone();
                         let proto2 = proto.clone();
                         let limiter2 = domain_limiter.clone();
@@ -309,7 +270,6 @@ async fn run_listener(
                                 peer.to_string(),
                                 proto2,
                                 listen_port,
-                                routes2,
                                 cfg2,
                                 limiter2,
                             )
@@ -338,7 +298,6 @@ async fn handle_connection(
     peer: String,
     proto: String,
     listen_port: u16,
-    routes: Arc<RouteTable>,
     cfg: Arc<AppConfig>,
     domain_limiter: Option<Arc<DomainLimiter>>,
 ) -> Result<()> {
@@ -375,14 +334,26 @@ async fn handle_connection(
             }
         }
 
-        // ── Hosts table, then per-listener routes ─────────────────────────────
-        let (final_host, final_port, mapped_from_hosts) = resolve_destination(
+        // ── Hosts allowlist + DNS override ──────────────────────────────────────
+        let (final_host, final_port, mapped_from_hosts) = match resolve_destination(
             &hostname,
             port,
             listen_port,
             cfg.hosts_table.as_deref(),
-            &routes,
-        );
+        ) {
+            DestinationOutcome::Ok {
+                host,
+                port: dest_port,
+                mapped_from_hosts,
+            } => (host, dest_port, mapped_from_hosts),
+            DestinationOutcome::Unlisted => {
+                warn!(
+                    "Rejecting {peer} → {hostname}: hostname not allowed (no matching hosts entry)"
+                );
+                metrics::connection_rejected(&labels, "unlisted_host");
+                return Ok(());
+            }
+        };
 
         labels.set_upstream(&final_host);
 
@@ -477,39 +448,54 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Apply sniproxy `table hosts`, then per-listener `routes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestinationOutcome {
+    Ok {
+        host: String,
+        port: u16,
+        mapped_from_hosts: bool,
+    },
+    Unlisted,
+}
+
+/// `hosts` controls which hostnames may use the proxy and optional DNS/IP override.
+///
+/// - Without `{ pattern: ".*", address: "*" }` in `hosts`, only matching patterns are relayed.
+/// - With that catch-all, every hostname is relayed.
 fn resolve_destination(
     hostname: &str,
     port: u16,
     listen_port: u16,
     hosts: Option<&HostsTable>,
-    routes: &RouteTable,
-) -> (String, u16, bool) {
-    if let Some(table) = hosts {
-        if let Some(resolved) = table.resolve(hostname) {
-            let (h, p) = apply_host_resolve(hostname, port, listen_port, resolved);
-            return (h, p, true);
+) -> DestinationOutcome {
+    match hosts {
+        None => DestinationOutcome::Ok {
+            host: hostname.to_string(),
+            port,
+            mapped_from_hosts: false,
+        },
+        Some(table) => {
+            let allowed = table.has_open_catchall() || table.resolve(hostname).is_some();
+            if !allowed {
+                return DestinationOutcome::Unlisted;
+            }
+
+            if let Some(resolved) = table.resolve(hostname) {
+                let (host, dest_port) = apply_host_resolve(hostname, port, listen_port, resolved);
+                DestinationOutcome::Ok {
+                    host,
+                    port: dest_port,
+                    mapped_from_hosts: true,
+                }
+            } else {
+                DestinationOutcome::Ok {
+                    host: hostname.to_string(),
+                    port,
+                    mapped_from_hosts: false,
+                }
+            }
         }
     }
-
-    let target_host = match routes.resolve(hostname) {
-        Some("*") | None => hostname.to_string(),
-        Some(target) => target.to_string(),
-    };
-
-    let (h, p) = if target_host.contains(':') {
-        let mut parts = target_host.splitn(2, ':');
-        let h = parts.next().unwrap().to_string();
-        let p = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(listen_port);
-        (h, p)
-    } else {
-        (target_host, port)
-    };
-
-    (h, p, false)
 }
 
 fn apply_host_resolve(
@@ -694,6 +680,71 @@ fn parse_host_port(s: &str, default_port: u16) -> (String, u16) {
             (host, port)
         }
         None => (s.to_string(), default_port),
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn hosts_table(entries: &[(&str, &str)]) -> HostsTable {
+        use crate::hosts::HostsEntry;
+        let rows: Vec<HostsEntry> = entries
+            .iter()
+            .map(|(p, a)| HostsEntry {
+                pattern: (*p).to_string(),
+                address: (*a).to_string(),
+            })
+            .collect();
+        HostsTable::compile(&rows).unwrap()
+    }
+
+    #[test]
+    fn hosts_allowlist_rejects_unlisted() {
+        let hosts = hosts_table(&[(r".*\.limoodns\.com", "*")]);
+        assert_eq!(
+            resolve_destination("open.spotify.com", 443, 443, Some(&hosts)),
+            DestinationOutcome::Unlisted
+        );
+    }
+
+    #[test]
+    fn hosts_allowlist_permits_listed() {
+        let hosts = hosts_table(&[(r".*\.limoodns\.com", "*")]);
+        assert!(matches!(
+            resolve_destination("yooz106.limoodns.com", 443, 443, Some(&hosts)),
+            DestinationOutcome::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn hosts_catchall_allows_any() {
+        let hosts = hosts_table(&[(".*", "*")]);
+        assert!(matches!(
+            resolve_destination("open.spotify.com", 443, 443, Some(&hosts)),
+            DestinationOutcome::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn hosts_ip_override() {
+        let hosts = hosts_table(&[("oceanupsky.com", "18.178.60.126")]);
+        assert_eq!(
+            resolve_destination("oceanupsky.com", 443, 443, Some(&hosts)),
+            DestinationOutcome::Ok {
+                host: "18.178.60.126".into(),
+                port: 443,
+                mapped_from_hosts: true,
+            }
+        );
+    }
+
+    #[test]
+    fn no_hosts_table_allows_all() {
+        assert!(matches!(
+            resolve_destination("open.spotify.com", 443, 443, None),
+            DestinationOutcome::Ok { .. }
+        ));
     }
 }
 

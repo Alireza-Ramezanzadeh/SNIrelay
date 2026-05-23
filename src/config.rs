@@ -155,21 +155,6 @@ impl std::fmt::Display for UpstreamProxy {
     }
 }
 
-// ── Routing table entry ───────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteEntry {
-    /// Regex pattern matched against the SNI/Host. Use ".*" for wildcard.
-    pub pattern: String,
-    /// Target address.  "*" means "same host, same port".
-    #[serde(default = "default_target")]
-    pub target: String,
-}
-
-fn default_target() -> String {
-    "*".to_string()
-}
-
 // ── Listener configuration ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,9 +168,9 @@ pub struct ListenerConfig {
     /// If omitted, inferred from the port (80/8080 → http, otherwise tls).
     #[serde(default)]
     pub proto: Option<String>,
-    /// Routing table for this listener
-    #[serde(default = "default_routes")]
-    pub routes: Vec<RouteEntry>,
+    /// Deprecated: ignored. Use global [`AppConfig::hosts`] for allowlist and DNS.
+    #[serde(default, skip_serializing)]
+    routes: Vec<serde_yaml::Value>,
 }
 
 impl ListenerConfig {
@@ -238,10 +223,6 @@ impl ListenerConfig {
         .to_string());
         Ok(())
     }
-}
-
-fn default_routes() -> Vec<RouteEntry> {
-    vec![RouteEntry { pattern: ".*".to_string(), target: "*".to_string() }]
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -302,7 +283,8 @@ pub struct AppConfig {
     #[serde(default = "default_listen_backlog")]
     pub listen_backlog: u32,
 
-    /// Static hostname → IP map. Checked before per-listener routes.
+    /// Which hostnames may use the proxy (allowlist) and optional DNS/IP override.
+    /// Add `{ pattern: ".*", address: "*" }` to relay any hostname; otherwise only listed patterns.
     #[serde(default)]
     pub hosts: Vec<crate::hosts::HostsEntry>,
 
@@ -332,13 +314,13 @@ fn default_listeners() -> Vec<ListenerConfig> {
             name: Some("https".to_string()),
             addr: "0.0.0.0:443".to_string(),
             proto: Some("tls".to_string()),
-            routes: default_routes(),
+            routes: Vec::new(),
         },
         ListenerConfig {
             name: Some("http".to_string()),
             addr: "0.0.0.0:80".to_string(),
             proto: Some("http".to_string()),
-            routes: default_routes(),
+            routes: Vec::new(),
         },
     ]
 }
@@ -461,6 +443,13 @@ impl AppConfig {
         }
 
         for (i, listener) in self.listens.iter_mut().enumerate() {
+            if !listener.routes.is_empty() {
+                tracing::warn!(
+                    "listens[{i}] {}: `routes` is deprecated and ignored; use global `hosts` only",
+                    listener.addr
+                );
+                listener.routes.clear();
+            }
             listener
                 .normalize_proto()
                 .with_context(|| format!("listens[{i}] ({})", listener.addr))?;
@@ -643,25 +632,13 @@ listens:
   - name: https-main
     addr: "0.0.0.0:443"
     proto: tls
-    routes:
-      - pattern: ".*"
-        target: "*"
   - name: https-alt
     addr: "0.0.0.0:8443"
     proto: tls
-    routes:
-      - pattern: ".*"
-        target: "*"
   - name: http-main
     addr: "0.0.0.0:80"
     proto: http
-    routes:
-      - pattern: ".*"
-        target: "*"
   - addr: "0.0.0.0:8080"
-    routes:
-      - pattern: ".*"
-        target: "*"
 "#;
         let mut cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
         cfg.finalize().unwrap();
@@ -678,15 +655,9 @@ listens:
 tls_listen:
   - addr: "0.0.0.0:9443"
     proto: tls
-    routes:
-      - pattern: ".*"
-        target: "*"
 http_listen:
   - addr: "0.0.0.0:8080"
     proto: http
-    routes:
-      - pattern: ".*"
-        target: "*"
 "#;
         let mut cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
         cfg.finalize().unwrap();

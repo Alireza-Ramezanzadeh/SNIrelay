@@ -31,12 +31,17 @@ pub enum HostResolve {
 pub struct HostsTable {
     exact: HashMap<String, HostResolve>,
     patterns: Vec<(Regex, HostResolve)>,
+    /// `true` when config contains `{ pattern: ".*", address: "*" }` — relay any hostname.
+    open_catchall: bool,
 }
 
 impl HostsTable {
     pub fn compile(entries: &[HostsEntry]) -> Result<Self> {
         let mut exact = HashMap::new();
         let mut patterns = Vec::new();
+        let open_catchall = entries.iter().any(|e| {
+            e.pattern.trim() == ".*" && e.address.trim() == "*"
+        });
 
         for (i, entry) in entries.iter().enumerate() {
             let (is_exact, key, resolve) = compile_entry(&entry.pattern, &entry.address)
@@ -53,7 +58,16 @@ impl HostsTable {
             }
         }
 
-        Ok(HostsTable { exact, patterns })
+        Ok(HostsTable {
+            exact,
+            patterns,
+            open_catchall,
+        })
+    }
+
+    /// Whether `{ pattern: ".*", address: "*" }` is configured (relay all hostnames).
+    pub fn has_open_catchall(&self) -> bool {
+        self.open_catchall
     }
 
     /// First-match wins: exact host map, then regex patterns in config order.
