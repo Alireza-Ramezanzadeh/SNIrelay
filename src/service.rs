@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 use regex::Regex;
 
 use crate::config::{AppConfig, RouteEntry};
+use crate::domain_limiter::DomainLimiter;
 use crate::hosts::{HostResolve, HostsTable};
 use crate::metrics::{self, TargetLabels};
 use crate::proxy_connector;
@@ -65,13 +66,36 @@ impl RouteTable {
 pub struct SniProxyService {
     cfg: Arc<AppConfig>,
     connection_slots: Arc<Semaphore>,
+    domain_limiter: Option<Arc<DomainLimiter>>,
 }
 
 impl SniProxyService {
     pub fn new(cfg: AppConfig, max_connections: usize) -> Self {
+        let domain_limiter = if cfg.domain_limits.is_empty() {
+            None
+        } else {
+            let state_path = cfg.domain_limits_state_path();
+            match DomainLimiter::load(cfg.domain_limits.clone(), state_path.clone()) {
+                Ok(limiter) => {
+                    if let Some(ref path) = state_path {
+                        info!(
+                            path = %path.display(),
+                            persist_secs = cfg.domain_limits_persist_secs,
+                            "Domain limits state will persist across restarts"
+                        );
+                    }
+                    Some(Arc::new(limiter))
+                }
+                Err(e) => {
+                    error!("Failed to load domain limits state: {e:#}");
+                    None
+                }
+            }
+        };
         SniProxyService {
             cfg: Arc::new(cfg),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
+            domain_limiter,
         }
     }
 
@@ -79,7 +103,23 @@ impl SniProxyService {
     pub async fn run(self) -> Result<()> {
         let cfg = self.cfg.clone();
         let connection_slots = self.connection_slots.clone();
+        let domain_limiter = self.domain_limiter.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let persist_interval = Duration::from_secs(cfg.domain_limits_persist_secs);
+        let persist_handle = domain_limiter.as_ref().map(|limiter| {
+            let limiter = limiter.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(persist_interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = limiter.flush_if_dirty() {
+                        warn!("Failed to persist domain limits: {e:#}");
+                    }
+                }
+            })
+        });
 
         let mut handles = Vec::new();
 
@@ -96,6 +136,7 @@ impl SniProxyService {
             let shutdown_rx = shutdown_rx.clone();
             let slots = connection_slots.clone();
             let backlog = cfg.listen_backlog;
+            let limiter = domain_limiter.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = run_listener(
@@ -108,6 +149,7 @@ impl SniProxyService {
                     shutdown_rx,
                     slots,
                     backlog,
+                    limiter,
                 )
                 .await
                 {
@@ -140,6 +182,15 @@ impl SniProxyService {
 
         for h in handles {
             let _ = h.await;
+        }
+
+        if let Some(h) = persist_handle {
+            h.abort();
+        }
+        if let Some(ref limiter) = domain_limiter {
+            if let Err(e) = limiter.persist_now() {
+                warn!("Final domain limits persist failed: {e:#}");
+            }
         }
 
         info!("Stopped.");
@@ -216,6 +267,7 @@ async fn run_listener(
     mut shutdown_rx: watch::Receiver<bool>,
     connection_slots: Arc<Semaphore>,
     backlog: u32,
+    domain_limiter: Option<Arc<DomainLimiter>>,
 ) -> Result<()> {
     let listener = bind_listener(&addr, backlog)
         .await
@@ -248,6 +300,7 @@ async fn run_listener(
                         let routes2 = routes.clone();
                         let cfg2 = cfg.clone();
                         let proto2 = proto.clone();
+                        let limiter2 = domain_limiter.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -258,6 +311,7 @@ async fn run_listener(
                                 listen_port,
                                 routes2,
                                 cfg2,
+                                limiter2,
                             )
                             .await
                             {
@@ -286,6 +340,7 @@ async fn handle_connection(
     listen_port: u16,
     routes: Arc<RouteTable>,
     cfg: Arc<AppConfig>,
+    domain_limiter: Option<Arc<DomainLimiter>>,
 ) -> Result<()> {
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let mut labels = TargetLabels::unknown();
@@ -308,6 +363,17 @@ async fn handle_connection(
 
         labels.set_domain(&hostname);
         debug!("Connection from {peer}: host={hostname} port={port}");
+
+        // ── Per-domain limits check ───────────────────────────────────────────
+        if let Some(ref limiter) = domain_limiter {
+            if let Err(reason) = limiter.check_connection(&hostname) {
+                warn!(
+                    "Rejecting {peer} → {hostname}: {reason}"
+                );
+                metrics::connection_rejected(&labels, &reason.to_string());
+                return Ok(());
+            }
+        }
 
         // ── Hosts table, then per-listener routes ─────────────────────────────
         let (final_host, final_port, mapped_from_hosts) = resolve_destination(
@@ -384,9 +450,16 @@ async fn handle_connection(
                 .context("Failed to flush upstream after replay")?;
         }
 
-        // ── Bidirectional splice ────────────────────────────────────────────
+        // ── Bidirectional splice (bytes counted toward daily quota per chunk) ─
         let rw_timeout = Duration::from_secs(cfg.rw_timeout_secs);
-        let (c2u, u2c) = splice(client, upstream, rw_timeout).await;
+        let (c2u, u2c) = splice(
+            client,
+            upstream,
+            rw_timeout,
+            domain_limiter.clone(),
+            hostname.clone(),
+        )
+        .await;
 
         metrics::connection_closed(&labels, c2u, u2c);
         opened = false;
@@ -632,7 +705,12 @@ const SPLICE_BUF_SIZE: usize = 64 * 1024;
 /// written** per chunk. Unlike `tokio::io::copy`, if the peer aborts (RST / broken pipe)
 /// after part of the transfer, completed chunks still contribute to the total — so metrics
 /// match partial downloads (e.g. Ctrl+C on `wget`).
-async fn copy_counting<R, W>(mut reader: R, mut writer: W) -> u64
+async fn copy_counting<R, W>(
+    mut reader: R,
+    mut writer: W,
+    limiter: Option<&DomainLimiter>,
+    domain: &str,
+) -> u64
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -646,7 +724,15 @@ where
             Err(_) => break,
         };
         match writer.write_all(&buf[..n]).await {
-            Ok(()) => total += n as u64,
+            Ok(()) => {
+                total += n as u64;
+                if let Some(lim) = limiter {
+                    if lim.account_bytes(domain, n as u64).is_err() {
+                        warn!(domain = %domain, "Daily bandwidth limit exceeded, closing transfer");
+                        break;
+                    }
+                }
+            }
             Err(_) => break,
         }
     }
@@ -659,13 +745,28 @@ async fn splice(
     client: TcpStream,
     upstream: TcpStream,
     _rw_timeout: Duration,
+    limiter: Option<Arc<DomainLimiter>>,
+    domain: String,
 ) -> (u64, u64) {
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut ur, mut uw) = tokio::io::split(upstream);
 
-    let c2u = tokio::spawn(async move { copy_counting(&mut cr, &mut uw).await });
+    let limiter_c2u = limiter.clone();
+    let domain_c2u = domain.clone();
+    let c2u = tokio::spawn(async move {
+        copy_counting(
+            &mut cr,
+            &mut uw,
+            limiter_c2u.as_deref(),
+            &domain_c2u,
+        )
+        .await
+    });
 
-    let u2c = tokio::spawn(async move { copy_counting(&mut ur, &mut cw).await });
+    let limiter_u2c = limiter;
+    let u2c = tokio::spawn(async move {
+        copy_counting(&mut ur, &mut cw, limiter_u2c.as_deref(), &domain).await
+    });
 
     let c2u_bytes = c2u.await.unwrap_or(0);
     let u2c_bytes = u2c.await.unwrap_or(0);

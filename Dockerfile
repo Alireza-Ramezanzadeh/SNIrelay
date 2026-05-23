@@ -39,15 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN groupadd -r sniproxy && useradd -r -g sniproxy -s /usr/sbin/nologin sniproxy
+# Non-root user (optional; container defaults to root for :80/:443)
+RUN groupadd -r snirelay && useradd -r -g snirelay -s /usr/sbin/nologin snirelay
 
 COPY --from=builder /build/target/release/snirelay /usr/local/bin/snirelay
-RUN chmod +x /usr/local/bin/snirelay \
-    && ln -sf /usr/local/bin/snirelay /usr/local/bin/pingora-sniproxy
+RUN chmod +x /usr/local/bin/snirelay
 
 # Default config directory (mount a volume here)
-RUN mkdir -p /etc/sniproxy && chown sniproxy:sniproxy /etc/sniproxy
+RUN mkdir -p /etc/sniproxy /var/lib/snirelay && chown snirelay:snirelay /etc/sniproxy /var/lib/snirelay
 COPY config/config.yaml /etc/sniproxy/config.yaml
 
 # ── Entrypoint script (handles PROXY env var) ─────────────────────────────────

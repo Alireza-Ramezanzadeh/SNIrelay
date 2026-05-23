@@ -634,7 +634,7 @@ def main():
         "panels": p,
         "refresh": "30s",
         "schemaVersion": 39,
-        "tags": ["sniproxy", "pingora-sniproxy", "proxy", "sni", "l4"],
+        "tags": ["snirelay", "sniproxy", "proxy", "sni", "l4"],
         "templating": {
             "list": [
                 {
@@ -707,10 +707,10 @@ def main():
         "time": {"from": "now-6h", "to": "now"},
         "timepicker": {"refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]},
         "timezone": "browser",
-        "title": "SNI Proxy — pingora-sniproxy",
-        "uid": "sniproxy-overview",
+        "title": "SNIrelay",
+        "uid": "snirelay-overview",
         "version": 1,
-        "description": "Production dashboard for pingora-sniproxy (Prometheus job: sniproxy).",
+        "description": "Production dashboard for SNIrelay (Prometheus metrics prefix: sniproxy_).",
     }
 
     out = Path(__file__).parent / "dashboards" / "sniproxy-overview.json"

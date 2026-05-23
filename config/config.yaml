@@ -45,12 +45,12 @@ listens:
       - pattern: ".*"
         target: "*"
 
-  - name: https-limooagent
-    addr: "0.0.0.0:7081"
-    proto: tls
-    routes:
-      - pattern: ".*"
-        target: "*"
+  # - name: https-limooagent
+  #   addr: "0.0.0.0:7081"
+  #   proto: tls
+  #   routes:
+  #     - pattern: ".*"
+  #       target: "*"
 
 
   # ─── Per-listener routing examples ───
@@ -93,6 +93,41 @@ hosts:
   - pattern: ".*"
     address: "*"
 
+# ── Per-domain daily limits (SNI / Host) ──────────────────────────────────────
+# Keys match the exact SNI/Host or any subdomain (e.g. limoodns.com covers
+# yooz106.limoodns.com). Case-insensitive. You may also use the top-level key `limits:`.
+# Both fields are optional — omit a field to leave that dimension unlimited.
+#
+# daily_bandwidth: total bytes (upload + download) allowed per UTC calendar day.
+#   Accepts SI units:  "100GB"  "20MB"  "1TB"
+#   or IEC units:      "100GiB" "20MiB"
+#   or a raw integer:  107374182400
+#
+# daily_connections: maximum new connections per UTC calendar day.
+#
+# When a limit is reached, new connections are rejected before upstream connect.
+# Bandwidth is also enforced during an active transfer (the session is cut off
+# once the daily quota is exceeded, typically within one 64 KiB buffer).
+# Counters reset at UTC midnight.
+#
+# Counters are saved to disk so Docker restarts do not reset quotas (mount a volume):
+# domain_limits_state_file: /var/lib/snirelay/domain_limits.json
+# domain_limits_persist_secs: 5
+#
+# Example:
+# domain_limits:
+#   example.com:
+#     daily_bandwidth: "100GB"
+#     daily_connections: 10000
+#
+#   api.example.com:
+#     daily_bandwidth: "20GB"
+#     daily_connections: 2000
+#
+#   heavydownload.example.com:
+#     daily_bandwidth: "500GB"
+#     # no connection limit for this domain
+
 # ── Timeouts ──────────────────────────────────────────────────────────────────
 connect_timeout_secs: 10
 rw_timeout_secs: 300
@@ -105,6 +140,13 @@ nofile_limit: 1048576
 # Upper bound; capped at ~(nofile_limit - 128) / 2 (two sockets per session).
 max_connections: 50000
 listen_backlog: 4096
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# By default logs go to stdout only (Docker journal / systemd captures them).
+# Set log_file to also append the same lines to a file:
+# log_file: /var/log/snirelay/snirelay.log
+# Or: snirelay --log-file /var/log/snirelay.log
+# Or: LOG_FILE=/var/log/snirelay.log  (Docker: mount a volume on that path)
 
 # ── Observability (Prometheus) ────────────────────────────────────────────────
 # Labels: client_ip (input), domain (SNI/Host), upstream (tunnel target)

@@ -8,11 +8,12 @@ set -e
 
 # Docker CMD used to pass the binary name; ignore it if present.
 case "$1" in
-    snirelay|pingora-sniproxy|/usr/local/bin/snirelay|/usr/local/bin/pingora-sniproxy) shift ;;
+    snirelay|/usr/local/bin/snirelay) shift ;;
 esac
 
 CONFIG_FILE="${CONFIG_FILE:-/etc/sniproxy/config.yaml}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
+LOG_FILE="${LOG_FILE:-}"
 
 # Default route gateway from /proc/net/route.
 docker_host_gateway() {
@@ -76,11 +77,19 @@ else
     ulimit -n 65535 2>/dev/null || true
 fi
 
+log_file_args() {
+    if [ -n "${LOG_FILE}" ]; then
+        echo "--log-file" "${LOG_FILE}"
+    fi
+}
+
 if [ -n "${PROXY}" ]; then
     echo "[entrypoint] Using upstream proxy: ${PROXY}"
     echo "[entrypoint] Starting: snirelay --config ${CONFIG_FILE} --log-level ${LOG_LEVEL} --proxy ${PROXY}"
-    exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" --proxy "${PROXY}" "$@"
+    # shellcheck disable=SC2046
+    exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" --proxy "${PROXY}" $(log_file_args) "$@"
 fi
 
 echo "[entrypoint] Starting: snirelay --config ${CONFIG_FILE} --log-level ${LOG_LEVEL}"
-exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" "$@"
+# shellcheck disable=SC2046
+exec snirelay --config "${CONFIG_FILE}" --log-level "${LOG_LEVEL}" $(log_file_args) "$@"

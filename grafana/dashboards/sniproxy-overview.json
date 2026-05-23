@@ -1965,8 +1965,8 @@
   "refresh": "30s",
   "schemaVersion": 39,
   "tags": [
+    "snirelay",
     "sniproxy",
-    "pingora-sniproxy",
     "proxy",
     "sni",
     "l4"
@@ -2072,8 +2072,8 @@
     ]
   },
   "timezone": "browser",
-  "title": "SNI Proxy \u2014 pingora-sniproxy",
-  "uid": "sniproxy-overview",
+  "title": "SNIrelay",
+  "uid": "snirelay-overview",
   "version": 1,
-  "description": "Production dashboard for pingora-sniproxy (Prometheus job: sniproxy)."
+  "description": "Production dashboard for SNIrelay (Prometheus metrics prefix: sniproxy_)."
 }

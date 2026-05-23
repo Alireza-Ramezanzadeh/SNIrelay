@@ -30,8 +30,8 @@
 It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay end-to-end between the client and the real server.
 
 **Repository:** [github.com/Alireza-Ramezanzadeh/SNIrelay](https://github.com/Alireza-Ramezanzadeh/SNIrelay)  
-**Docker Hub:** `docker.io/alirezaramezanzadeh/snirelay:0.1.1` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))  
-**GitHub Packages:** `ghcr.io/alireza-ramezanzadeh/snirelay:0.1.1` ([GitHub Packages](https://github.com/Alireza-Ramezanzadeh/SNIrelay/pkgs/container/snirelay))
+**Docker Hub:** `docker.io/alirezaramezanzadeh/snirelay:0.2.0` ([Docker Hub](https://hub.docker.com/r/alirezaramezanzadeh/snirelay))  
+**GitHub Packages:** `ghcr.io/alireza-ramezanzadeh/snirelay:0.2.0` ([GitHub Packages](https://github.com/Alireza-Ramezanzadeh/SNIrelay/pkgs/container/snirelay))
 
 ## Features
 
@@ -43,7 +43,8 @@ It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay en
 - **Prometheus metrics** — Global and per-`client_ip` / `domain` / `upstream` breakdown
 - **Grafana-ready** — Import [`grafana/dashboards/sniproxy-overview.json`](grafana/dashboards/sniproxy-overview.json)
 - **Docker & host network** — Smart loopback remapping for bridge vs `--network host`
-- **Graceful shutdown** — SIGINT / SIGTERM stops listeners cleanly
+- **Per-domain daily limits** — Bandwidth and connection quotas by SNI/Host; persisted across restarts
+- **Graceful shutdown** — SIGINT / SIGTERM stops listeners cleanly; limit counters flushed to disk
 
 ## How it works
 
@@ -62,16 +63,17 @@ Images are published to both **Docker Hub** and **GitHub Packages**. Use **host 
 
 ```bash
 # Docker Hub
-docker pull alirezaramezanzadeh/snirelay:0.1.1
+docker pull alirezaramezanzadeh/snirelay:0.2.0
 
 # GitHub Packages
-docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.1.1
+docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.2.0
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
   -v /path/to/config.yaml:/etc/sniproxy/config.yaml \
+  -v snirelay-data:/var/lib/snirelay \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.1
+  alirezaramezanzadeh/snirelay:0.2.0
 ```
 
 ### From source
@@ -96,35 +98,47 @@ Official image: **[`alirezaramezanzadeh/snirelay`](https://hub.docker.com/r/alir
 
 | Tag | Image | Use |
 |-----|--------|-----|
-| **`0.1.1`** | `alirezaramezanzadeh/snirelay:0.1.1` | Pinned release (recommended for production) |
-| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.1.1` after each release push |
+| **`0.2.0`** | `alirezaramezanzadeh/snirelay:0.2.0` | Pinned release (recommended for production) |
+| **`latest`** | `alirezaramezanzadeh/snirelay:latest` | Same build as `0.2.0` after each release push |
 
 ### Pull and run
 
 ```bash
-docker pull alirezaramezanzadeh/snirelay:0.1.1
+docker pull alirezaramezanzadeh/snirelay:0.2.0
 
 docker run --rm -it --network host \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -v snirelay-data:/var/lib/snirelay \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.1
+  alirezaramezanzadeh/snirelay:0.2.0
 ```
 
 ### Build and push (maintainers)
 
-From the repository root, after `docker login`:
+**GitHub Actions (recommended):** push a version tag and the workflow publishes images:
 
 ```bash
-export IMAGE=alirezaramezanzadeh/snirelay
-export VERSION=0.1.1
-
-docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
-docker push "${IMAGE}:${VERSION}"
-docker push "${IMAGE}:latest"
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-The container runs the **`snirelay`** binary (`/usr/local/bin/snirelay`). A symlink **`pingora-sniproxy`** remains for older scripts.
+This builds and pushes `ghcr.io/<owner>/snirelay:0.2.0` and `:latest`. For Docker Hub, add repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (see [`.github/workflows/release-docker.yml`](.github/workflows/release-docker.yml)).
+
+**Manual push** (after `docker login`):
+
+```bash
+export VERSION=0.2.0
+export IMAGE=alirezaramezanzadeh/snirelay
+export GHCR=ghcr.io/alireza-ramezanzadeh/snirelay
+
+docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" \
+             -t "${GHCR}:${VERSION}" -t "${GHCR}:latest" .
+docker push "${IMAGE}:${VERSION}" && docker push "${IMAGE}:latest"
+docker push "${GHCR}:${VERSION}" && docker push "${GHCR}:latest"
+```
+
+The container runs the **`snirelay`** binary at `/usr/local/bin/snirelay`.
 
 ## Configuration
 
@@ -190,7 +204,7 @@ docker run -d --name snirelay --restart unless-stopped \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.1.1
+  alirezaramezanzadeh/snirelay:0.2.0
 ```
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.

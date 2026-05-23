@@ -111,6 +111,17 @@ static ERRORS_BY_LABEL: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap()
 });
 
+static REJECTED_BY_LIMIT: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        opts!(
+            "sniproxy_rejected_connections_total",
+            "Connections rejected before upstream connect due to per-domain limits"
+        ),
+        &["domain", "reason"]
+    )
+    .unwrap()
+});
+
 /// Sanitize values for Prometheus labels (safe, bounded length).
 pub fn label_value(raw: &str) -> String {
     let s: String = raw
@@ -205,6 +216,12 @@ pub fn connection_closed(labels: &TargetLabels, client_to_upstream: u64, upstrea
             .with_label_values(&[&lv[0], &lv[1], &lv[2], "upstream_to_client"])
             .inc_by(upstream_to_client);
     }
+}
+
+pub fn connection_rejected(labels: &TargetLabels, reason: &str) {
+    REJECTED_BY_LIMIT
+        .with_label_values(&[&labels.domain, reason])
+        .inc();
 }
 
 pub fn connection_failed(labels: &TargetLabels, was_open: bool) {

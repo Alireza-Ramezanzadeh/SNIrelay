@@ -7,11 +7,105 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::hosts::HostsTable;
+
+// ── ByteSize — human-readable byte quantity ───────────────────────────────────
+//
+// Accepts "100GB", "20MiB", "500MB", a plain integer (bytes), etc.
+// SI: KB=1000, MB=1e6, GB=1e9, TB=1e12
+// IEC: KiB=1024, MiB=2^20, GiB=2^30, TiB=2^40
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ByteSize(pub u64);
+
+fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    const SUFFIXES: &[(&str, u64)] = &[
+        ("TiB", 1_099_511_627_776),
+        ("GiB", 1_073_741_824),
+        ("MiB", 1_048_576),
+        ("KiB", 1_024),
+        ("TB",  1_000_000_000_000),
+        ("GB",  1_000_000_000),
+        ("MB",  1_000_000),
+        ("KB",  1_000),
+        ("B",   1),
+    ];
+    for (suffix, factor) in SUFFIXES {
+        if s.len() >= suffix.len()
+            && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        {
+            let num_str = &s[..s.len() - suffix.len()];
+            let n: f64 = num_str.trim().parse()
+                .map_err(|_| format!("invalid number before '{suffix}' in '{s}'"))?;
+            if n < 0.0 {
+                return Err(format!("byte size cannot be negative: '{s}'"));
+            }
+            return Ok((n * *factor as f64) as u64);
+        }
+    }
+    s.parse::<u64>().map_err(|_| format!("cannot parse '{s}' as a byte size (try e.g. \"100GB\")"))
+}
+
+impl<'de> Deserialize<'de> for ByteSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ByteSizeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ByteSizeVisitor {
+            type Value = ByteSize;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a byte size string like \"100GB\" or a raw integer")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ByteSize, E> {
+                Ok(ByteSize(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ByteSize, E> {
+                if v < 0 {
+                    Err(E::custom("byte size cannot be negative"))
+                } else {
+                    Ok(ByteSize(v as u64))
+                }
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<ByteSize, E> {
+                parse_byte_size(s).map(ByteSize).map_err(E::custom)
+            }
+
+            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<ByteSize, E> {
+                self.visit_str(&s)
+            }
+        }
+
+        deserializer.deserialize_any(ByteSizeVisitor)
+    }
+}
+
+// ── Per-domain traffic/connection limits ──────────────────────────────────────
+
+/// Limits for a single domain, applied per UTC calendar day.
+/// Both fields are optional — omit to leave that dimension unlimited.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DomainLimitConfig {
+    /// Maximum bytes (upload + download combined) per calendar day (UTC).
+    /// Accepts "100GB", "20MiB", or a raw integer (bytes).
+    #[serde(default)]
+    pub daily_bandwidth: Option<ByteSize>,
+
+    /// Maximum new connections per calendar day (UTC).
+    #[serde(default)]
+    pub daily_connections: Option<u64>,
+}
 
 // ── Upstream proxy kind ───────────────────────────────────────────────────────
 
@@ -186,6 +280,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub metrics_addr: Option<String>,
 
+    /// Append logs to this path (stdout logging remains enabled).
+    /// Overridden by `--log-file` or the `LOG_FILE` environment variable.
+    #[serde(default)]
+    pub log_file: Option<String>,
+
     /// How often to rebuild the /metrics snapshot in the background (seconds).
     #[serde(default = "default_metrics_refresh_secs")]
     pub metrics_refresh_secs: u64,
@@ -210,6 +309,21 @@ pub struct AppConfig {
     /// Compiled hosts table (filled by [`AppConfig::finalize`]).
     #[serde(skip)]
     pub hosts_table: Option<Arc<HostsTable>>,
+
+    /// Per-domain daily bandwidth and connection limits.
+    /// Keys match the exact SNI/Host or any subdomain (case-insensitive).
+    #[serde(default, alias = "limits")]
+    pub domain_limits: HashMap<String, DomainLimitConfig>,
+
+    /// Persist daily limit counters to this JSON file (survives restarts).
+    /// When `domain_limits` is set and this is omitted, defaults to
+    /// `/var/lib/snirelay/domain_limits.json`. Override with `DOMAIN_LIMITS_STATE_FILE`.
+    #[serde(default)]
+    pub domain_limits_state_file: Option<String>,
+
+    /// How often to flush limit counters to disk (seconds).
+    #[serde(default = "default_domain_limits_persist_secs")]
+    pub domain_limits_persist_secs: u64,
 }
 
 fn default_listeners() -> Vec<ListenerConfig> {
@@ -235,6 +349,7 @@ fn default_max_conn()        -> usize { 50_000 }
 fn default_nofile_limit()   -> u64 { 1_048_576 }
 fn default_listen_backlog() -> u32 { 4096 }
 fn default_metrics_refresh_secs() -> u64 { 2 }
+fn default_domain_limits_persist_secs() -> u64 { 5 }
 
 impl Default for UpstreamProxy {
     fn default() -> Self {
@@ -258,17 +373,37 @@ impl Default for AppConfig {
             rw_timeout_secs: default_rw_timeout(),
             workers: 0,
             metrics_addr: None,
+            log_file: None,
             metrics_refresh_secs: default_metrics_refresh_secs(),
             max_connections: default_max_conn(),
             nofile_limit: default_nofile_limit(),
             listen_backlog: default_listen_backlog(),
             hosts: Vec::new(),
             hosts_table: None,
+            domain_limits: HashMap::new(),
+            domain_limits_state_file: None,
+            domain_limits_persist_secs: default_domain_limits_persist_secs(),
         }
     }
 }
 
 impl AppConfig {
+    /// State file path for domain limit counters, if limits are configured.
+    pub fn domain_limits_state_path(&self) -> Option<std::path::PathBuf> {
+        if self.domain_limits.is_empty() {
+            return None;
+        }
+        if let Some(path) = &self.domain_limits_state_file {
+            return Some(std::path::PathBuf::from(path));
+        }
+        if let Ok(path) = std::env::var("DOMAIN_LIMITS_STATE_FILE") {
+            if !path.is_empty() {
+                return Some(std::path::PathBuf::from(path));
+            }
+        }
+        Some(std::path::PathBuf::from("/var/lib/snirelay/domain_limits.json"))
+    }
+
     /// Load config from YAML file, falling back to defaults if file not found.
     pub fn load(path: &str) -> Result<Self> {
         // First check environment variables (Docker-friendly)
@@ -465,6 +600,18 @@ fn hex_le_ipv4(hex: &str) -> Option<String> {
         octet(1)?,
         octet(0)?
     ))
+}
+
+#[cfg(test)]
+mod byte_size_tests {
+    use super::parse_byte_size;
+
+    #[test]
+    fn mib_suffix_is_case_insensitive() {
+        assert_eq!(parse_byte_size("20MiB").unwrap(), 20 * 1_048_576);
+        assert_eq!(parse_byte_size("20Mib").unwrap(), 20 * 1_048_576);
+        assert_eq!(parse_byte_size("20mib").unwrap(), 20 * 1_048_576);
+    }
 }
 
 #[cfg(test)]
