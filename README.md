@@ -68,11 +68,11 @@ docker pull alirezaramezanzadeh/snirelay:0.2.2
 # GitHub Packages
 docker pull ghcr.io/alireza-ramezanzadeh/snirelay:0.2.2
 
-docker run --rm -it --network host \
+docker run -d --restart always  --network host \
   --ulimit nofile=1048576:1048576 \
-  -v /path/to/config.yaml:/etc/sniproxy/config.yaml \
-  -v snirelay-data:/var/lib/snirelay \
-  -e PROXY="socks5 127.0.0.1 10808" \
+  -v $(pwd)/snirelay/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -v $(pwd)/snirelay:/var/lib/snirelay  \
+  --name snirelay \
   alirezaramezanzadeh/snirelay:0.2.2
 ```
 
