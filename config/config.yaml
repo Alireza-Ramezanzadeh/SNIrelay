@@ -30,10 +30,6 @@ listens:
 hosts:
   - pattern: translate.wordpress.com
     address: 192.0.78.12
-  - pattern: eu.taline.ir
-    address: 91.107.161.221
-  - pattern: bimemosaferati.com
-    address: 95.156.253.59
   - pattern: downloads.wordpress.org
     address: 198.143.164.250
 
