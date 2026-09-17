@@ -458,9 +458,15 @@ impl AppConfig {
         Ok(())
     }
 
-    /// When running inside Docker, `127.0.0.1` / `localhost` on the upstream proxy
-    /// refer to the container, not the host where v2ray/SOCKS usually listens.
+    /// Remap loopback upstreams when the gateway resembles a Docker bridge.
+    /// Host networking shares the host loopback; gateway detection is heuristic.
     pub fn remap_docker_loopback_upstream(&mut self) {
+        let Some((host, _)) = self.upstream_proxy.host_port() else {
+            return;
+        };
+        if !is_loopback_host(host) {
+            return;
+        }
         if !Path::new("/.dockerenv").exists() {
             return;
         }
@@ -486,8 +492,8 @@ impl AppConfig {
 
         if !is_docker_bridge_gateway(&gw) {
             tracing::info!(
-                "Docker: default gateway is {gw} (not docker0 bridge); keeping upstream 127.0.0.1 \
-                 (`docker run --network host` shares the host loopback)"
+                "Docker: default gateway {gw} does not match the bridge heuristic; \
+                 keeping upstream {host} (`--network host` shares the host loopback)"
             );
             return;
         }
@@ -623,6 +629,32 @@ mod docker_tests {
     fn docker_bridge_gateway_detection() {
         assert!(is_docker_bridge_gateway("172.17.0.1"));
         assert!(!is_docker_bridge_gateway("31.214.250.65"));
+    }
+
+    #[test]
+    fn public_socks_yaml_preserves_endpoint_and_routing() {
+        let yaml = r#"
+upstream_proxy:
+  type: socks5
+  host: "103.75.197.9"
+  port: 1080
+listens:
+  - name: https
+    addr: "0.0.0.0:443"
+    proto: tls
+  - name: http
+    addr: "0.0.0.0:80"
+    proto: http
+hosts:
+  - pattern: ".*"
+    address: "*"
+"#;
+        let mut cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        cfg.finalize().unwrap();
+        cfg.remap_docker_loopback_upstream();
+        assert_eq!(cfg.upstream_proxy.host_port(), Some(("103.75.197.9", 1080)));
+        assert_eq!(cfg.listens.len(), 2);
+        assert_eq!(cfg.hosts_table.as_ref().unwrap().stats(), (0, 1));
     }
 
     #[test]

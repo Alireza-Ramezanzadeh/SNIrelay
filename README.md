@@ -213,6 +213,24 @@ docker run -d --name snirelay --restart unless-stopped \
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.
 
+**Compose configuration mount** — the entrypoint reads `/etc/sniproxy/config.yaml` by default:
+
+```yaml
+services:
+  snirelay:
+    image: alirezaramezanzadeh/snirelay:0.2.2
+    network_mode: host
+    volumes:
+      - ./snirelay/config.yaml:/etc/sniproxy/config.yaml:ro
+```
+
+If mounting at `/app/config.yaml`, also set `CONFIG_FILE: /app/config.yaml` under
+`environment`. Otherwise the bundled configuration remains active. After changing
+the mount or environment, recreate the service with
+`docker compose up -d --force-recreate snirelay`. `--proxy` overrides `PROXY`, which
+overrides YAML. Startup logs report the configuration path and effective upstream
+source without proxy credentials.
+
 **Heavy traffic tuning:**
 
 ```yaml

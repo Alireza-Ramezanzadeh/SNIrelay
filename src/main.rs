@@ -70,6 +70,25 @@ async fn main() -> Result<()> {
 
     logging::init(&cli.log_level, log_file.as_deref())?;
 
+    // Config loading happens before tracing is initialized, so report its source here.
+    if let Ok(path) = std::fs::canonicalize(&cli.config) {
+        info!(config_file = %path.display(), "Loaded configuration file");
+    } else {
+        tracing::warn!(config_file = %cli.config, "Configuration file missing; using defaults and environment overrides");
+    }
+    let upstream_source = if cli.proxy.is_some() {
+        "CLI --proxy"
+    } else if let Ok(value) = std::env::var("PROXY") {
+        if crate::config::parse_proxy_string(&value).is_ok() {
+            "PROXY environment variable"
+        } else {
+            tracing::warn!("Invalid PROXY environment variable ignored; expected '<type> <host> <port>'");
+            "configuration/defaults"
+        }
+    } else {
+        "configuration/defaults"
+    };
+
     // CLI --proxy overrides config file
     if let Some(proxy_str) = cli.proxy {
         cfg.upstream_proxy = crate::config::parse_proxy_string(&proxy_str)?;
@@ -78,7 +97,7 @@ async fn main() -> Result<()> {
     cfg.remap_docker_loopback_upstream();
 
     info!("Starting SNIrelay v{}", env!("CARGO_PKG_VERSION"));
-    info!("Upstream proxy: {:?}", cfg.upstream_proxy);
+    info!(source = upstream_source, "Upstream proxy: {}", cfg.upstream_proxy);
     for listener in &cfg.listens {
         info!(
             "Listen [{}] {} proto={}",

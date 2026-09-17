@@ -32,9 +32,9 @@ pub async fn probe_upstream(proxy: &UpstreamProxy, connect_timeout: Duration) ->
             .with_context(|| format!("timed out connecting to SOCKS5 proxy {host}:{port}"))?
             .with_context(|| {
                 format!(
-                    "cannot reach SOCKS5 proxy at {host}:{port} from this network namespace \
-                     (in Docker, 127.0.0.1 is the container — use 172.17.0.1, --network host, \
-                     or enable LAN on the host SOCKS listener)"
+                    "cannot reach SOCKS5 proxy at {host}:{port}; check the effective upstream \
+                     configuration, SOCKS listener bind address/port, and firewall. \
+                     Docker host networking shares the host loopback; bridge networking does not"
                 )
             })?;
 
