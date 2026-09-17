@@ -16,8 +16,67 @@ use tracing::{debug, info};
 
 use crate::config::UpstreamProxy;
 
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn probe_mock(reply: Option<[u8; 2]>) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            if let Some(reply) = reply {
+                stream.write_all(&reply).await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let proxy = UpstreamProxy::Socks5 {
+            host: "127.0.0.1".into(), port, username: None, password: None,
+        };
+        let result = timeout(
+            Duration::from_secs(2),
+            probe_upstream(&proxy, Duration::from_millis(100)),
+        ).await;
+        server.abort();
+        let _ = server.await;
+        result.expect("probe exceeded its deadline while waiting for SOCKS greeting")
+    }
+
+    #[tokio::test]
+    async fn silent_socks_server_times_out() {
+        let error = probe_mock(None).await.unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn socks_greeting_success() {
+        probe_mock(Some([5, 0])).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks_greeting_rejection_is_preserved() {
+        let error = probe_mock(Some([5, 255])).await.unwrap_err();
+        assert!(format!("{error:#}").contains("rejected all auth methods"));
+    }
+}
+
 /// Verify the configured upstream proxy is reachable before accepting clients.
 pub async fn probe_upstream(proxy: &UpstreamProxy, connect_timeout: Duration) -> Result<()> {
+    // TCP may connect successfully while the proxy never answers the greeting.
+    // Bound the whole probe, including writes and reads, before listener startup.
+    timeout(connect_timeout, probe_upstream_inner(proxy, connect_timeout))
+        .await
+        .with_context(|| format!(
+            "upstream probe timed out after {connect_timeout:?} for {proxy} \
+             (TCP connection or proxy handshake); listeners have not started"
+        ))?
+}
+
+async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) -> Result<()> {
     match proxy {
         UpstreamProxy::Direct => {
             info!("Upstream proxy: direct (no probe)");
@@ -38,6 +97,7 @@ pub async fn probe_upstream(proxy: &UpstreamProxy, connect_timeout: Duration) ->
                 )
             })?;
 
+            info!("Connected to SOCKS5 proxy {host}:{port}; waiting for SOCKS5 greeting response");
             let auth_method: u8 = if username.is_some() { 0x02 } else { 0x00 };
             stream.write_all(&[0x05, 0x01, auth_method]).await?;
             let mut resp = [0u8; 2];

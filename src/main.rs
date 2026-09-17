@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
     info!(source = upstream_source, "Upstream proxy: {}", cfg.upstream_proxy);
     for listener in &cfg.listens {
         info!(
-            "Listen [{}] {} proto={}",
+            "Configured listener [{}] {} proto={} (not bound yet)",
             listener.label(),
             listener.addr,
             listener.proto_str()
@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
     }
 
     let probe_timeout = Duration::from_secs(cfg.connect_timeout_secs);
+    info!(timeout_secs = cfg.connect_timeout_secs, "Checking upstream before binding listeners");
     crate::proxy_connector::probe_upstream(&cfg.upstream_proxy, probe_timeout).await?;
 
     let process_limits = limits::apply(&cfg)?;
