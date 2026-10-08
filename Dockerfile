@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy only the manifest first. This layer is invalidated only when Cargo.toml
 # changes, not on every source edit.
 COPY Cargo.toml Cargo.lock* ./
+# rust-embed needs panel assets present even for the dependency-cache stub build.
+COPY panel/dist/ ./panel/dist/
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && cargo build --release 2>&1 || true \
@@ -27,6 +29,7 @@ RUN mkdir -p src \
 # ── Real source ───────────────────────────────────────────────────────────────
 # Use trailing slash on both sides to make COPY src/ -> src/ explicit.
 COPY src/ ./src/
+COPY panel/dist/ ./panel/dist/
 RUN touch src/main.rs && cargo build --release
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +57,7 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Expose ports (add every port from config `listens` when using -p mapping)
-EXPOSE 80/tcp 443/tcp 8080/tcp 8443/tcp 9090/tcp
+EXPOSE 80/tcp 443/tcp 8080/tcp 8443/tcp 9080/tcp 9090/tcp
 
 # Use non-root (Note: ports 80/443 require NET_BIND_SERVICE or run as root)
 # For production, use --cap-add=NET_BIND_SERVICE or bind to 8080/8443

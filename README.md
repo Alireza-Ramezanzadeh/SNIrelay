@@ -196,6 +196,55 @@ The top row **Selected time range (totals)** shows bytes transferred (total, upl
 
 Regenerate the JSON after editing queries: `python3 grafana/gen_dashboard.py`.
 
+## Admin panel
+
+SNIrelay embeds a bilingual (EN/FA) admin UI on **`:9080`** (configurable via `panel.addr`).
+
+| Feature | Description |
+|---------|-------------|
+| Dashboard | Active sessions, bytes, upstream health, daily traffic chart |
+| Traffic by IP | Upload/download/sessions per client IP (+ per-domain drill-down) |
+| Domains | CRUD + bulk import for dnsmasq → snirelay routing |
+| Query log | AdGuard-style DNS queries from dnsmasq (`log-queries`) |
+| dnsmasq | Export / Apply `address=/domain/RELAY_IP` snippet |
+| Hosts | Hot-reload SNIrelay `hosts` allowlist |
+| Auth | Cookie session; set `ADMIN_PASSWORD` (default `snirelay`) |
+
+### DNS query log (dnsmasq)
+
+Enable query logging on the host, then point the panel at the file:
+
+```bash
+# /etc/dnsmasq.d/logging.conf  (or add to dnsmasq.conf)
+log-queries
+log-facility=/var/log/dnsmasq/queries.log
+```
+
+```bash
+sudo mkdir -p /var/log/dnsmasq
+sudo touch /var/log/dnsmasq/queries.log
+sudo chown dnsmasq:dnsmasq /var/log/dnsmasq/queries.log   # or root:root
+sudo kill -HUP $(pidof dnsmasq)
+```
+
+Set `panel.dnsmasq_query_log` / `DNSMASQ_QUERY_LOG=/var/log/dnsmasq/queries.log` and mount
+`/var/log/dnsmasq` into the container (see `docker-compose.yml`). The panel tails the file
+into SQLite and shows client IP, type, domain, and answer (relay / cached / forwarded).
+
+```bash
+docker run -d --name snirelay --restart unless-stopped \
+  --network host \
+  --ulimit nofile=1048576:1048576 \
+  -v $(pwd)/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -v snirelay-data:/var/lib/snirelay \
+  -e ADMIN_PASSWORD='change-me' \
+  -e RELAY_IP='94.182.174.181' \
+  -e PROXY="socks5 127.0.0.1 10808" \
+  alirezaramezanzadeh/snirelay:0.3.0
+```
+
+Open `http://SERVER:9080/`. SQLite state lives at `/var/lib/snirelay/panel.db`.
+
 ## Production
 
 **Open files** — raise per-process limit, not only `sysctl fs.file-max`:
@@ -207,8 +256,10 @@ docker run -d --name snirelay --restart unless-stopped \
   --network host \
   --ulimit nofile=1048576:1048576 \
   -v /root/snirelay.yaml:/etc/sniproxy/config.yaml \
+  -v snirelay-data:/var/lib/snirelay \
+  -e ADMIN_PASSWORD='change-me' \
   -e PROXY="socks5 127.0.0.1 10808" \
-  alirezaramezanzadeh/snirelay:0.2.2
+  alirezaramezanzadeh/snirelay:0.3.0
 ```
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.
@@ -218,10 +269,14 @@ docker run -d --name snirelay --restart unless-stopped \
 ```yaml
 services:
   snirelay:
-    image: alirezaramezanzadeh/snirelay:0.2.2
+    image: alirezaramezanzadeh/snirelay:0.3.0
     network_mode: host
+    environment:
+      ADMIN_PASSWORD: change-me
+      RELAY_IP: "94.182.174.181"
     volumes:
-      - ./snirelay/config.yaml:/etc/sniproxy/config.yaml:ro
+      - ./snirelay/config.yaml:/etc/sniproxy/config.yaml
+      - snirelay-data:/var/lib/snirelay
 ```
 
 If mounting at `/app/config.yaml`, also set `CONFIG_FILE: /app/config.yaml` under

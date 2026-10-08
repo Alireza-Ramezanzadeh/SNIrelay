@@ -34,6 +34,10 @@ hosts:
     address: 198.143.164.250
 
 connect_timeout_secs: 10
+# Retry SOCKS/HTTP upstream at startup (Docker/Xray race). Soft-fail by default.
+upstream_probe_wait_secs: 60
+upstream_probe_interval_secs: 2
+upstream_probe_required: false
 rw_timeout_secs: 300
 workers: 0
 nofile_limit: 1048576
@@ -41,3 +45,20 @@ max_connections: 50000
 listen_backlog: 4096
 metrics_addr: "0.0.0.0:9090"
 metrics_refresh_secs: 2
+
+# Admin panel (embedded UI + SQLite). Default password: snirelay (or ADMIN_PASSWORD).
+panel:
+  enabled: true
+  addr: "0.0.0.0:9080"
+  db_path: "/var/lib/snirelay/panel.db"
+  # Public IP inserted into dnsmasq address=/domain/IP lines
+  relay_ip: "94.182.174.181"
+  # Live-edit host dnsmasq drop-ins (mount /etc/dnsmasq.d into the container)
+  dnsmasq_conf_dir: "/etc/dnsmasq.d"
+  # Optional explicit files (auto-detected if omitted):
+  # dnsmasq_relay_file: "/etc/dnsmasq.d/routed.conf"
+  # dnsmasq_bypass_file: "/etc/dnsmasq.d/bypass.conf"
+  dnsmasq_reload_cmd: "kill -HUP $(pidof dnsmasq)"
+  # AdGuard-style query log: enable in dnsmasq (log-queries + log-facility=file)
+  dnsmasq_query_log: "/var/log/dnsmasq/queries.log"
+  dns_query_retain_hours: 72

@@ -8,11 +8,11 @@
 
 use anyhow::{Context, Result, bail};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
-use tracing::{debug, info};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, info, warn};
 
 use crate::config::UpstreamProxy;
 
@@ -62,6 +62,46 @@ mod probe_tests {
         let error = probe_mock(Some([5, 255])).await.unwrap_err();
         assert!(format!("{error:#}").contains("rejected all auth methods"));
     }
+
+    #[tokio::test]
+    async fn ensure_ready_soft_fails_when_not_required() {
+        let proxy = UpstreamProxy::Socks5 {
+            host: "127.0.0.1".into(),
+            port: 1, // nothing listens
+            username: None,
+            password: None,
+        };
+        let ok = ensure_upstream_ready(
+            &proxy,
+            Duration::from_millis(50),
+            Duration::from_millis(120),
+            Duration::from_millis(40),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_hard_fails_when_required() {
+        let proxy = UpstreamProxy::Socks5 {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: None,
+            password: None,
+        };
+        let err = ensure_upstream_ready(
+            &proxy,
+            Duration::from_millis(50),
+            Duration::from_millis(120),
+            Duration::from_millis(40),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("still unreachable"));
+    }
 }
 
 /// Verify the configured upstream proxy is reachable before accepting clients.
@@ -74,6 +114,75 @@ pub async fn probe_upstream(proxy: &UpstreamProxy, connect_timeout: Duration) ->
             "upstream probe timed out after {connect_timeout:?} for {proxy} \
              (TCP connection or proxy handshake); listeners have not started"
         ))?
+}
+
+/// Retry [`probe_upstream`] until success, deadline, or optional hard failure.
+///
+/// Returns `Ok(true)` when the upstream answered, `Ok(false)` when soft-failing
+/// after the wait window, and `Err` when `required` and still unreachable.
+pub async fn ensure_upstream_ready(
+    proxy: &UpstreamProxy,
+    connect_timeout: Duration,
+    wait: Duration,
+    interval: Duration,
+    required: bool,
+) -> Result<bool> {
+    if matches!(proxy, UpstreamProxy::Direct) {
+        probe_upstream(proxy, connect_timeout).await?;
+        return Ok(true);
+    }
+
+    let deadline = Instant::now() + wait;
+    let mut attempt: u32 = 0;
+    let mut last_err = String::from("unknown error");
+
+    loop {
+        attempt += 1;
+        match probe_upstream(proxy, connect_timeout).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    info!(
+                        attempt,
+                        "Upstream proxy became reachable after retries: {proxy}"
+                    );
+                }
+                return Ok(true);
+            }
+            Err(e) => {
+                last_err = format!("{e:#}");
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                warn!(
+                    attempt,
+                    wait_left_secs = remaining.as_secs(),
+                    "Upstream probe failed ({proxy}): {last_err}; retrying in {}s",
+                    interval.as_secs().max(1)
+                );
+                sleep(interval.min(remaining)).await;
+            }
+        }
+    }
+
+    let detail = last_err;
+    if required {
+        let wait_secs = wait.as_secs();
+        bail!(
+            "upstream proxy {proxy} still unreachable after {wait_secs}s ({attempt} attempt(s)): {detail}\n\
+             Hint: on the host run `ss -lntp | grep -E '1080|10808'` and confirm Xray/SOCKS is up.\n\
+             With Docker use `docker run --network host` (or compose `network_mode: host`) so \
+             `127.0.0.1` is the host loopback. Set UPSTREAM_PROBE_REQUIRED=false to start anyway."
+        );
+    }
+
+    warn!(
+        attempts = attempt,
+        wait_secs = wait.as_secs(),
+        "Upstream proxy {proxy} unreachable after startup wait — starting listeners anyway. \
+         New connections will fail until SOCKS is available. Last error: {detail}"
+    );
+    Ok(false)
 }
 
 async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) -> Result<()> {

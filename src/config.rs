@@ -249,6 +249,22 @@ pub struct AppConfig {
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
 
+    /// How long to retry the upstream reachability probe at startup (seconds).
+    /// Covers Docker Compose races where Xray/SOCKS starts after SNIrelay.
+    /// Override with `UPSTREAM_PROBE_WAIT_SECS`.
+    #[serde(default = "default_upstream_probe_wait_secs")]
+    pub upstream_probe_wait_secs: u64,
+
+    /// Delay between upstream probe attempts (seconds).
+    #[serde(default = "default_upstream_probe_interval_secs")]
+    pub upstream_probe_interval_secs: u64,
+
+    /// If true, exit when the upstream is still unreachable after `upstream_probe_wait_secs`.
+    /// If false (default), log a warning and start listeners anyway so a later SOCKS recovery
+    /// does not require a container restart. Override with `UPSTREAM_PROBE_REQUIRED=true`.
+    #[serde(default = "default_upstream_probe_required")]
+    pub upstream_probe_required: bool,
+
     /// Per-connection read/write timeout (seconds)
     #[serde(default = "default_rw_timeout")]
     pub rw_timeout_secs: u64,
@@ -306,6 +322,84 @@ pub struct AppConfig {
     /// How often to flush limit counters to disk (seconds).
     #[serde(default = "default_domain_limits_persist_secs")]
     pub domain_limits_persist_secs: u64,
+
+    /// Embedded admin panel (SQLite + UI). Disabled when `enabled: false`.
+    #[serde(default)]
+    pub panel: PanelConfig,
+
+    /// Path of the YAML config file that was loaded (filled at runtime; not from YAML).
+    #[serde(skip)]
+    pub config_path: Option<String>,
+}
+
+/// Admin panel bind address, database, and dnsmasq integration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PanelConfig {
+    /// Master switch. Default true so Docker images ship with a panel.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Listen address for the panel HTTP server.
+    #[serde(default = "default_panel_addr")]
+    pub addr: String,
+    /// SQLite database path.
+    #[serde(default = "default_panel_db")]
+    pub db_path: String,
+    /// Public/server IP written into dnsmasq `address=/domain/IP` lines.
+    #[serde(default)]
+    pub relay_ip: Option<String>,
+    /// Directory of dnsmasq drop-in configs (e.g. `/etc/dnsmasq.d`). When set,
+    /// the Domains tab reads/writes live dnsmasq files instead of SQLite.
+    #[serde(default)]
+    pub dnsmasq_conf_dir: Option<String>,
+    /// File for `address=/…/RELAY_IP` rules. Auto-detected if omitted.
+    #[serde(default)]
+    pub dnsmasq_relay_file: Option<String>,
+    /// File for bypass `server=/…/#` rules. Auto-detected if omitted.
+    #[serde(default)]
+    pub dnsmasq_bypass_file: Option<String>,
+    /// Legacy single-file export path (still used as relay file fallback).
+    #[serde(default)]
+    pub dnsmasq_conf_path: Option<String>,
+    /// Optional absolute path to dnsmasq query log (`log-queries` + `log-facility=/path`).
+    #[serde(default)]
+    pub dnsmasq_query_log: Option<String>,
+    /// How long to keep DNS query log rows in SQLite (hours). Default 72.
+    #[serde(default = "default_dns_query_retain_hours")]
+    pub dns_query_retain_hours: u64,
+    /// Optional shell command after writing dnsmasq config (e.g. `kill -HUP $(pidof dnsmasq)`).
+    #[serde(default)]
+    pub dnsmasq_reload_cmd: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_panel_addr() -> String {
+    "0.0.0.0:9080".into()
+}
+fn default_panel_db() -> String {
+    "/var/lib/snirelay/panel.db".into()
+}
+fn default_dns_query_retain_hours() -> u64 {
+    72
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            addr: default_panel_addr(),
+            db_path: default_panel_db(),
+            relay_ip: None,
+            dnsmasq_conf_dir: None,
+            dnsmasq_relay_file: None,
+            dnsmasq_bypass_file: None,
+            dnsmasq_conf_path: None,
+            dnsmasq_query_log: None,
+            dns_query_retain_hours: default_dns_query_retain_hours(),
+            dnsmasq_reload_cmd: None,
+        }
+    }
 }
 
 fn default_listeners() -> Vec<ListenerConfig> {
@@ -326,6 +420,9 @@ fn default_listeners() -> Vec<ListenerConfig> {
 }
 
 fn default_connect_timeout() -> u64 { 10 }
+fn default_upstream_probe_wait_secs() -> u64 { 60 }
+fn default_upstream_probe_interval_secs() -> u64 { 2 }
+fn default_upstream_probe_required() -> bool { false }
 fn default_rw_timeout()     -> u64 { 300 }
 fn default_max_conn()        -> usize { 50_000 }
 fn default_nofile_limit()   -> u64 { 1_048_576 }
@@ -352,6 +449,9 @@ impl Default for AppConfig {
             http_listen: Vec::new(),
             upstream_proxy: UpstreamProxy::default(),
             connect_timeout_secs: default_connect_timeout(),
+            upstream_probe_wait_secs: default_upstream_probe_wait_secs(),
+            upstream_probe_interval_secs: default_upstream_probe_interval_secs(),
+            upstream_probe_required: default_upstream_probe_required(),
             rw_timeout_secs: default_rw_timeout(),
             workers: 0,
             metrics_addr: None,
@@ -365,6 +465,8 @@ impl Default for AppConfig {
             domain_limits: HashMap::new(),
             domain_limits_state_file: None,
             domain_limits_persist_secs: default_domain_limits_persist_secs(),
+            panel: PanelConfig::default(),
+            config_path: None,
         }
     }
 }
@@ -401,6 +503,9 @@ impl AppConfig {
             if let Some(proxy) = from_env.upstream_proxy_override {
                 cfg.upstream_proxy = proxy;
             }
+            apply_probe_env_overrides(&mut cfg);
+            apply_panel_env_overrides(&mut cfg);
+            cfg.config_path = Some(path.to_string());
 
             cfg.finalize()?;
             Ok(cfg)
@@ -410,6 +515,9 @@ impl AppConfig {
             if let Some(proxy) = from_env.upstream_proxy_override {
                 cfg.upstream_proxy = proxy;
             }
+            apply_probe_env_overrides(&mut cfg);
+            apply_panel_env_overrides(&mut cfg);
+            cfg.config_path = Some(path.to_string());
             cfg.finalize()?;
             Ok(cfg)
         }
@@ -552,6 +660,106 @@ pub fn parse_proxy_string(s: &str) -> Result<UpstreamProxy> {
             Ok(UpstreamProxy::Http { host, port, auth: None })
         }
         other => bail!("Unknown proxy type '{}'. Expected socks5 or http", other),
+    }
+}
+
+fn apply_probe_env_overrides(cfg: &mut AppConfig) {
+    if let Ok(v) = std::env::var("UPSTREAM_PROBE_WAIT_SECS") {
+        if let Ok(secs) = v.parse::<u64>() {
+            cfg.upstream_probe_wait_secs = secs;
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_PROBE_INTERVAL_SECS") {
+        if let Ok(secs) = v.parse::<u64>() {
+            cfg.upstream_probe_interval_secs = secs.max(1);
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_PROBE_REQUIRED") {
+        cfg.upstream_probe_required = matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+}
+
+fn apply_panel_env_overrides(cfg: &mut AppConfig) {
+    if let Ok(v) = std::env::var("PANEL_ADDR") {
+        if !v.is_empty() {
+            cfg.panel.addr = v;
+        }
+    }
+    if let Ok(v) = std::env::var("PANEL_DB") {
+        if !v.is_empty() {
+            cfg.panel.db_path = v;
+        }
+    }
+    if let Ok(v) = std::env::var("PANEL_ENABLED") {
+        cfg.panel.enabled = matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(v) = std::env::var("RELAY_IP") {
+        if !v.is_empty() {
+            cfg.panel.relay_ip = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_CONF_DIR") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_conf_dir = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_RELAY_FILE") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_relay_file = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_BYPASS_FILE") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_bypass_file = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_CONF_PATH") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_conf_path = Some(v.clone());
+            if cfg.panel.dnsmasq_relay_file.is_none() {
+                cfg.panel.dnsmasq_relay_file = Some(v);
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_QUERY_LOG") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_query_log = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("DNS_QUERY_RETAIN_HOURS") {
+        if let Ok(n) = v.parse::<u64>() {
+            cfg.panel.dns_query_retain_hours = n.max(1);
+        }
+    }
+    if let Ok(v) = std::env::var("DNSMASQ_RELOAD_CMD") {
+        if !v.is_empty() {
+            cfg.panel.dnsmasq_reload_cmd = Some(v);
+        }
+    }
+    // Auto-detect common dnsmasq query log when unset but present (e.g. mounted volume).
+    if cfg
+        .panel
+        .dnsmasq_query_log
+        .as_ref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        for candidate in [
+            "/var/log/dnsmasq/queries.log",
+            "/var/log/dnsmasq.log",
+            "/var/log/dnsmasq/dnsmasq.log",
+        ] {
+            if std::path::Path::new(candidate).is_file() {
+                cfg.panel.dnsmasq_query_log = Some(candidate.into());
+                break;
+            }
+        }
     }
 }
 

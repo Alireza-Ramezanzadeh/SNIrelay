@@ -24,7 +24,9 @@ use crate::config::AppConfig;
 use crate::domain_limiter::DomainLimiter;
 use crate::hosts::{HostResolve, HostsTable};
 use crate::metrics::{self, TargetLabels};
+use crate::panel::TrafficAggregator;
 use crate::proxy_connector;
+use crate::self_loop::SelfLoopGuard;
 use crate::sni::{self, PeekResult};
 
 // ── Top-level service ─────────────────────────────────────────────────────────
@@ -33,10 +35,18 @@ pub struct SniProxyService {
     cfg: Arc<AppConfig>,
     connection_slots: Arc<Semaphore>,
     domain_limiter: Option<Arc<DomainLimiter>>,
+    self_loop: Arc<SelfLoopGuard>,
+    traffic: Option<TrafficAggregator>,
+    hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
 }
 
 impl SniProxyService {
-    pub fn new(cfg: AppConfig, max_connections: usize) -> Self {
+    pub fn new(
+        cfg: Arc<AppConfig>,
+        max_connections: usize,
+        traffic: Option<TrafficAggregator>,
+        hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
+    ) -> Self {
         let domain_limiter = if cfg.domain_limits.is_empty() {
             None
         } else {
@@ -58,10 +68,14 @@ impl SniProxyService {
                 }
             }
         };
+        let self_loop = Arc::new(SelfLoopGuard::from_config(&cfg));
         SniProxyService {
-            cfg: Arc::new(cfg),
+            cfg,
             connection_slots: Arc::new(Semaphore::new(max_connections)),
             domain_limiter,
+            self_loop,
+            traffic,
+            hosts_live,
         }
     }
 
@@ -70,6 +84,9 @@ impl SniProxyService {
         let cfg = self.cfg.clone();
         let connection_slots = self.connection_slots.clone();
         let domain_limiter = self.domain_limiter.clone();
+        let self_loop = self.self_loop.clone();
+        let traffic = self.traffic.clone();
+        let hosts_live = self.hosts_live.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let persist_interval = Duration::from_secs(cfg.domain_limits_persist_secs);
@@ -101,6 +118,9 @@ impl SniProxyService {
             let slots = connection_slots.clone();
             let backlog = cfg.listen_backlog;
             let limiter = domain_limiter.clone();
+            let loop_guard = self_loop.clone();
+            let traffic2 = traffic.clone();
+            let hosts2 = hosts_live.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = run_listener(
@@ -113,6 +133,9 @@ impl SniProxyService {
                     slots,
                     backlog,
                     limiter,
+                    loop_guard,
+                    traffic2,
+                    hosts2,
                 )
                 .await
                 {
@@ -230,6 +253,9 @@ async fn run_listener(
     connection_slots: Arc<Semaphore>,
     backlog: u32,
     domain_limiter: Option<Arc<DomainLimiter>>,
+    self_loop: Arc<SelfLoopGuard>,
+    traffic: Option<TrafficAggregator>,
+    hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
 ) -> Result<()> {
     let listener = bind_listener(&addr, backlog)
         .await
@@ -262,6 +288,9 @@ async fn run_listener(
                         let cfg2 = cfg.clone();
                         let proto2 = proto.clone();
                         let limiter2 = domain_limiter.clone();
+                        let loop_guard2 = self_loop.clone();
+                        let traffic2 = traffic.clone();
+                        let hosts2 = hosts_live.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -272,6 +301,9 @@ async fn run_listener(
                                 listen_port,
                                 cfg2,
                                 limiter2,
+                                loop_guard2,
+                                traffic2,
+                                hosts2,
                             )
                             .await
                             {
@@ -300,6 +332,9 @@ async fn handle_connection(
     listen_port: u16,
     cfg: Arc<AppConfig>,
     domain_limiter: Option<Arc<DomainLimiter>>,
+    self_loop: Arc<SelfLoopGuard>,
+    traffic: Option<TrafficAggregator>,
+    hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
 ) -> Result<()> {
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let mut labels = TargetLabels::unknown();
@@ -334,12 +369,13 @@ async fn handle_connection(
             }
         }
 
-        // ── Hosts allowlist + DNS override ──────────────────────────────────────
+        // ── Hosts allowlist + DNS override (live table for panel hot-reload) ─
+        let hosts_snapshot = hosts_live.read().clone();
         let (final_host, final_port, mapped_from_hosts) = match resolve_destination(
             &hostname,
             port,
             listen_port,
-            cfg.hosts_table.as_deref(),
+            hosts_snapshot.as_deref(),
         ) {
             DestinationOutcome::Ok {
                 host,
@@ -354,6 +390,15 @@ async fn handle_connection(
                 return Ok(());
             }
         };
+
+        // ── Block hairpin to our own listen addresses (SOCKS egress loop) ─────
+        if self_loop.would_loop(&final_host, final_port).await {
+            warn!(
+                "Rejecting {peer} → {final_host}:{final_port}: destination is a local listen address (self-loop)"
+            );
+            metrics::connection_rejected(&labels, "self_loop");
+            return Ok(());
+        }
 
         labels.set_upstream(&final_host);
 
@@ -433,6 +478,9 @@ async fn handle_connection(
         .await;
 
         metrics::connection_closed(&labels, c2u, u2c);
+        if let Some(ref agg) = traffic {
+            agg.record(&labels.client_ip, &labels.domain, c2u, u2c);
+        }
         opened = false;
 
         debug!("Connection {peer} closed: ↑{c2u}B ↓{u2c}B");

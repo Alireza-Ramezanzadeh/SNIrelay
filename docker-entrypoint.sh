@@ -67,6 +67,13 @@ remap_proxy_loopback() {
 
 remap_proxy_loopback
 
+# Tip: loopback upstream only works with host networking + a live SOCKS on the host.
+if [ -f /.dockerenv ]; then
+    echo "[entrypoint] Upstream 127.0.0.1 needs: docker --network host (or compose network_mode: host)"
+    echo "[entrypoint] and host SOCKS up (e.g. ss -lntp | grep 10808). SNIrelay retries at startup."
+    echo "[entrypoint] Admin panel default: http://0.0.0.0:9080/  (ADMIN_PASSWORD / RELAY_IP env supported)"
+fi
+
 # Per-process open files (sysctl fs.file-max alone is not enough).
 if [ -n "${NOFILE_LIMIT:-}" ]; then
     ulimit -n "${NOFILE_LIMIT}" 2>/dev/null || \

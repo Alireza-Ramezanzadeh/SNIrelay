@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SNIrelay</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="login-view" class="login-shell hidden">
+    <div class="login-card">
+      <p class="brand-mark">SNIrelay</p>
+      <h1 data-i18n="loginTitle">Admin panel</h1>
+      <p class="muted" data-i18n="loginSub">Sign in to manage relay domains and traffic.</p>
+      <form id="login-form">
+        <label for="password" data-i18n="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required />
+        <button type="submit" data-i18n="signIn">Sign in</button>
+        <p id="login-error" class="error"></p>
+      </form>
+    </div>
+  </div>
+
+  <div id="app-view" class="app hidden">
+    <header class="topbar">
+      <div class="brand-block">
+        <span class="brand-mark">SNIrelay</span>
+        <span class="brand-sub" data-i18n="panelLabel">Control</span>
+      </div>
+      <nav class="nav">
+        <button data-tab="dashboard" class="nav-btn active" data-i18n="tabDashboard">Dashboard</button>
+        <button data-tab="traffic" class="nav-btn" data-i18n="tabTraffic">Traffic by IP</button>
+        <button data-tab="domains" class="nav-btn" data-i18n="tabDomains">Domains</button>
+        <button data-tab="queries" class="nav-btn" data-i18n="tabQueries">Query log</button>
+        <button data-tab="hosts" class="nav-btn" data-i18n="tabHosts">Hosts</button>
+        <button data-tab="settings" class="nav-btn" data-i18n="tabSettings">Settings</button>
+      </nav>
+      <div class="top-actions">
+        <button id="lang-toggle" class="ghost" type="button">FA</button>
+        <button id="logout-btn" class="ghost" type="button" data-i18n="logout">Logout</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="tab-dashboard" class="tab active">
+        <div class="kpi-row">
+          <article class="kpi"><span data-i18n="kpiActive">Active</span><strong id="kpi-active">—</strong></article>
+          <article class="kpi"><span data-i18n="kpiSessions">Sessions</span><strong id="kpi-sessions">—</strong></article>
+          <article class="kpi"><span data-i18n="kpiBytes">Bytes</span><strong id="kpi-bytes">—</strong></article>
+          <article class="kpi"><span data-i18n="kpiErrors">Errors</span><strong id="kpi-errors">—</strong></article>
+          <article class="kpi"><span data-i18n="kpiUpstream">Upstream</span><strong id="kpi-upstream">—</strong></article>
+        </div>
+        <div class="panel-card">
+          <div class="card-head">
+            <h2 data-i18n="dailyTraffic">Daily traffic</h2>
+            <select id="dash-range">
+              <option value="7d">7d</option>
+              <option value="30d">30d</option>
+              <option value="1d">1d</option>
+            </select>
+          </div>
+          <div id="daily-chart" class="bars"></div>
+        </div>
+      </section>
+
+      <section id="tab-traffic" class="tab">
+        <div class="panel-card">
+          <div class="card-head">
+            <h2 data-i18n="trafficTitle">Traffic by client IP</h2>
+            <div class="inline">
+              <select id="traffic-range">
+                <option value="1d">1d</option>
+                <option value="7d" selected>7d</option>
+                <option value="30d">30d</option>
+              </select>
+              <button id="refresh-traffic" class="ghost" data-i18n="refresh">Refresh</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-i18n="colIp">IP</th>
+                  <th data-i18n="colUp">Upload</th>
+                  <th data-i18n="colDown">Download</th>
+                  <th data-i18n="colTotal">Total</th>
+                  <th data-i18n="colSessions">Sessions</th>
+                  <th data-i18n="colLast">Last seen</th>
+                </tr>
+              </thead>
+              <tbody id="traffic-body"></tbody>
+            </table>
+          </div>
+          <div id="ip-detail" class="ip-detail hidden"></div>
+        </div>
+      </section>
+
+      <section id="tab-domains" class="tab">
+        <div class="split">
+          <div class="panel-card">
+            <div class="card-head">
+              <h2 data-i18n="domainsTitle">DNS domains</h2>
+              <span id="domains-meta" class="muted"></span>
+            </div>
+            <p id="domains-source" class="muted"></p>
+            <div class="inline" style="margin-bottom:12px">
+              <input id="dom-search" type="search" placeholder="Search…" style="max-width:240px" />
+              <select id="dom-filter">
+                <option value="all">all</option>
+                <option value="relay">relay</option>
+                <option value="bypass">bypass</option>
+              </select>
+              <button id="reload-domains" type="button" class="ghost" data-i18n="refresh">Refresh</button>
+              <button id="apply-dnsmasq" type="button" data-i18n="applyDnsmasq">Save &amp; reload</button>
+            </div>
+            <form id="domain-form" class="form-grid">
+              <input id="dom-pattern" placeholder="play.example.com" required />
+              <select id="dom-mode"><option value="relay">relay → address=/</option><option value="bypass">bypass → server=/#</option></select>
+              <button type="submit" data-i18n="addDomain">Add</button>
+            </form>
+            <textarea id="import-text" rows="4" data-i18n-placeholder="importPlaceholder" placeholder="Bulk: one domain per line, or paste address=/ / server=/ lines"></textarea>
+            <div class="inline">
+              <select id="import-mode"><option value="relay">import as relay</option><option value="bypass">import as bypass</option></select>
+              <button id="import-btn" type="button" data-i18n="import">Import</button>
+              <button id="export-dnsmasq" type="button" class="ghost" data-i18n="exportDnsmasq">Export</button>
+            </div>
+            <pre id="dnsmasq-out" class="code-block hidden"></pre>
+            <p id="domains-msg" class="muted"></p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Pattern</th><th>Mode</th><th>Source</th><th></th></tr></thead>
+                <tbody id="domains-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-queries" class="tab">
+        <div class="split queries-layout">
+          <div class="panel-card">
+            <div class="card-head">
+              <h2 data-i18n="queriesTitle">DNS query log</h2>
+              <span id="queries-meta" class="muted"></span>
+            </div>
+            <p id="queries-hint" class="muted"></p>
+            <div class="inline" style="margin-bottom:12px">
+              <input id="q-domain" type="search" placeholder="domain…" style="max-width:180px" data-i18n-placeholder="qFilterDomain" />
+              <input id="q-client" type="search" placeholder="client IP…" style="max-width:140px" data-i18n-placeholder="qFilterClient" />
+              <select id="q-action">
+                <option value="">all</option>
+                <option value="query">query</option>
+                <option value="relay">relay</option>
+                <option value="reply">reply</option>
+                <option value="cached">cached</option>
+                <option value="forwarded">forwarded</option>
+                <option value="config">config</option>
+              </select>
+              <button id="refresh-queries" type="button" class="ghost" data-i18n="refresh">Refresh</button>
+              <label class="inline muted" style="gap:4px">
+                <input id="q-autorefresh" type="checkbox" checked />
+                <span data-i18n="autoRefresh">Auto</span>
+              </label>
+              <button id="clear-queries" type="button" class="ghost" data-i18n="clearLog">Clear</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th data-i18n="colTime">Time</th>
+                    <th data-i18n="colIp">IP</th>
+                    <th data-i18n="colType">Type</th>
+                    <th data-i18n="colDomain">Domain</th>
+                    <th data-i18n="colAction">Status</th>
+                    <th data-i18n="colAnswer">Answer</th>
+                  </tr>
+                </thead>
+                <tbody id="queries-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="panel-card">
+            <div class="card-head"><h2 data-i18n="topDomains">Top domains</h2></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th data-i18n="colDomain">Domain</th><th data-i18n="colCount">Count</th></tr></thead>
+                <tbody id="queries-top-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-hosts" class="tab">
+        <div class="panel-card">
+          <div class="card-head"><h2 data-i18n="hostsTitle">SNIrelay hosts allowlist</h2></div>
+          <p class="muted" data-i18n="hostsHint">Catch-all `.*` allows every SNI/Host. Changes hot-reload.</p>
+          <textarea id="hosts-json" rows="12" class="code-input"></textarea>
+          <button id="save-hosts" type="button" data-i18n="saveHosts">Save hosts</button>
+          <p id="hosts-msg" class="muted"></p>
+        </div>
+      </section>
+
+      <section id="tab-settings" class="tab">
+        <div class="panel-card">
+          <div class="card-head"><h2 data-i18n="settingsTitle">Settings</h2></div>
+          <pre id="config-summary" class="code-block"></pre>
+          <form id="password-form" class="form-grid tight">
+            <input id="pw-current" type="password" data-i18n-placeholder="currentPassword" placeholder="Current password" required />
+            <input id="pw-new" type="password" data-i18n-placeholder="newPassword" placeholder="New password" required />
+            <button type="submit" data-i18n="changePassword">Change password</button>
+          </form>
+          <p id="pw-msg" class="muted"></p>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

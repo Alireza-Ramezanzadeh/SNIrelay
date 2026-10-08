@@ -14,11 +14,15 @@ mod domain_limiter;
 mod hosts;
 mod limits;
 mod logging;
+mod panel;
 mod proxy_connector;
+mod self_loop;
 mod sni;
 mod service;
 mod metrics;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -122,8 +126,23 @@ async fn main() -> Result<()> {
     }
 
     let probe_timeout = Duration::from_secs(cfg.connect_timeout_secs);
-    info!(timeout_secs = cfg.connect_timeout_secs, "Checking upstream before binding listeners");
-    crate::proxy_connector::probe_upstream(&cfg.upstream_proxy, probe_timeout).await?;
+    let probe_wait = Duration::from_secs(cfg.upstream_probe_wait_secs);
+    let probe_interval = Duration::from_secs(cfg.upstream_probe_interval_secs.max(1));
+    info!(
+        connect_timeout_secs = cfg.connect_timeout_secs,
+        wait_secs = cfg.upstream_probe_wait_secs,
+        interval_secs = cfg.upstream_probe_interval_secs.max(1),
+        required = cfg.upstream_probe_required,
+        "Checking upstream before binding listeners"
+    );
+    let upstream_ready = crate::proxy_connector::ensure_upstream_ready(
+        &cfg.upstream_proxy,
+        probe_timeout,
+        probe_wait,
+        probe_interval,
+        cfg.upstream_probe_required,
+    )
+    .await?;
 
     let process_limits = limits::apply(&cfg)?;
     info!(
@@ -136,7 +155,17 @@ async fn main() -> Result<()> {
         metrics::start_metrics_server(metrics_addr.clone(), cfg.metrics_refresh_secs).await?;
     }
 
+    let cfg = Arc::new(cfg);
+    let upstream_ok = Arc::new(AtomicBool::new(upstream_ready));
+    let (traffic, hosts_live) =
+        crate::panel::start_panel(cfg.clone(), upstream_ok.clone()).await?;
+
     // ── Run service ──────────────────────────────────────────────────────────
-    let service = SniProxyService::new(cfg, process_limits.max_connections);
+    let service = SniProxyService::new(
+        cfg,
+        process_limits.max_connections,
+        Some(traffic),
+        hosts_live,
+    );
     service.run().await
 }
