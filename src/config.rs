@@ -241,9 +241,52 @@ pub struct AppConfig {
     #[serde(default)]
     pub http_listen: Vec<ListenerConfig>,
 
-    /// Upstream proxy to tunnel traffic through
+    /// Upstream proxy to tunnel traffic through (legacy single-upstream / default profile).
+    /// When `upstreams` is empty, this becomes the sole profile named `"default"`.
     #[serde(default)]
     pub upstream_proxy: UpstreamProxy,
+
+    /// Named upstream profiles (SOCKS5 / HTTP / direct). Keys are profile names
+    /// (e.g. `middle-east`, `europe`). Empty → synthesized from `upstream_proxy`.
+    #[serde(default)]
+    pub upstreams: HashMap<String, UpstreamProxy>,
+
+    /// Profile name used when a client IP is not listed in `client_upstreams`.
+    #[serde(default)]
+    pub default_upstream: Option<String>,
+
+    /// Exact client IP → upstream profile name.
+    #[serde(default)]
+    pub client_upstreams: HashMap<String, String>,
+
+    /// When true, if the chosen upstream profile fails to connect, try other
+    /// profiles (preferred first, then `default_upstream`, then remaining names).
+    /// Default false — stick to the selected profile only.
+    #[serde(default)]
+    pub upstream_failover: bool,
+
+    /// Client IP allowlist for proxy listeners. Empty = allow all.
+    /// Panel (9080) is never filtered by this ACL.
+    ///
+    /// YAML accepts either a bare IP string or `{ ip, username }` objects.
+    #[serde(default)]
+    pub client_whitelist: Vec<WhitelistEntry>,
+
+    /// When true, panel add/remove also runs `ufw allow/delete from <ip>`.
+    #[serde(default = "default_true")]
+    pub client_whitelist_ufw: bool,
+
+    /// Optional path to the `ufw` binary (default `/usr/sbin/ufw` or `ufw` on PATH).
+    #[serde(default)]
+    pub ufw_bin: Option<String>,
+
+    /// Periodic upstream health checks + optional Telegram alerts.
+    #[serde(default)]
+    pub upstream_monitor: UpstreamMonitorConfig,
+
+    /// Telegram bot for monitor notifications (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`).
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 
     /// Connection timeout to upstream proxy (seconds)
     #[serde(default = "default_connect_timeout")]
@@ -374,6 +417,169 @@ pub struct PanelConfig {
 fn default_true() -> bool {
     true
 }
+
+/// Runtime upstream health monitor (lightweight SOCKS/HTTP handshake probes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamMonitorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds between full probe rounds (default 60).
+    #[serde(default = "default_monitor_interval_secs")]
+    pub interval_secs: u64,
+    /// Per-probe timeout (default 10s) — CONNECT + TLS/HTTP reply.
+    #[serde(default = "default_monitor_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Consecutive failures before marking DOWN + notify (default 2).
+    #[serde(default = "default_monitor_fail_threshold")]
+    pub fail_threshold: u32,
+    /// Consecutive successes before marking UP after DOWN (default 2).
+    #[serde(default = "default_monitor_recover_threshold")]
+    pub recover_threshold: u32,
+    /// Send Telegram message when a profile recovers.
+    #[serde(default = "default_true")]
+    pub notify_recovery: bool,
+    /// Min seconds between two similar alerts for the same profile (default 600).
+    #[serde(default = "default_monitor_cooldown_secs")]
+    pub notify_cooldown_secs: u64,
+    /// Profile names to monitor. Empty = all non-`direct` profiles.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Primary probe host (used when `probe_hosts` is empty).
+    /// Default `ifconfig.io` — matches a typical manual `curl --proxy … https://ifconfig.io` check.
+    #[serde(default = "default_monitor_probe_host")]
+    pub probe_host: String,
+    /// Port for `probe_host` / default port for entries in `probe_hosts` (default 443).
+    #[serde(default = "default_monitor_probe_port")]
+    pub probe_port: u16,
+    /// Optional list of `host` or `host:port`. When non-empty, **all** must succeed.
+    /// Useful when Cloudflare still answers but general HTTPS is dead.
+    #[serde(default)]
+    pub probe_hosts: Vec<String>,
+}
+
+impl UpstreamMonitorConfig {
+    /// Resolved `(host, port)` list for the e2e probe.
+    pub fn probe_targets(&self) -> Vec<(String, u16)> {
+        if self.probe_hosts.is_empty() {
+            return vec![(self.probe_host.clone(), self.probe_port)];
+        }
+        self.probe_hosts
+            .iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| parse_probe_target(s, self.probe_port))
+            .collect()
+    }
+
+    pub fn probe_targets_label(&self) -> String {
+        self.probe_targets()
+            .into_iter()
+            .map(|(h, p)| format!("{h}:{p}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl Default for UpstreamMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_monitor_interval_secs(),
+            timeout_secs: default_monitor_timeout_secs(),
+            fail_threshold: default_monitor_fail_threshold(),
+            recover_threshold: default_monitor_recover_threshold(),
+            notify_recovery: true,
+            notify_cooldown_secs: default_monitor_cooldown_secs(),
+            profiles: Vec::new(),
+            probe_host: default_monitor_probe_host(),
+            probe_port: default_monitor_probe_port(),
+            probe_hosts: Vec::new(),
+        }
+    }
+}
+
+fn parse_probe_target(raw: &str, default_port: u16) -> (String, u16) {
+    let s = raw.trim();
+    if let Some((host, port_s)) = s.rsplit_once(':') {
+        if !host.is_empty() && !host.contains(']') && port_s.parse::<u16>().is_ok() {
+            if let Ok(p) = port_s.parse::<u16>() {
+                return (host.to_string(), p);
+            }
+        }
+    }
+    // IPv6 in brackets: [2001:db8::1]:443
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((host, port_s)) = rest.split_once("]:") {
+            if let Ok(p) = port_s.parse::<u16>() {
+                return (host.to_string(), p);
+            }
+        }
+    }
+    (s.to_string(), default_port)
+}
+
+fn default_monitor_interval_secs() -> u64 {
+    60
+}
+fn default_monitor_timeout_secs() -> u64 {
+    10
+}
+fn default_monitor_fail_threshold() -> u32 {
+    2
+}
+fn default_monitor_recover_threshold() -> u32 {
+    2
+}
+fn default_monitor_cooldown_secs() -> u64 {
+    600
+}
+fn default_monitor_probe_host() -> String {
+    // Same target many operators use for `curl --proxy socks5://… https://ifconfig.io`.
+    // Cloudflare (one.one.one.one) often still works when the node is "half-dead".
+    "ifconfig.io".into()
+}
+fn default_monitor_probe_port() -> u16 {
+    443
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub bot_token: Option<String>,
+    #[serde(default)]
+    pub chat_id: Option<String>,
+    /// Bot API host base, e.g. `https://api.telegram.org` or a local reverse-proxy.
+    /// Override with `TELEGRAM_API_BASE`. Trailing slash is stripped.
+    #[serde(default = "default_telegram_api_base")]
+    pub api_base: String,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            bot_token: None,
+            chat_id: None,
+            api_base: default_telegram_api_base(),
+        }
+    }
+}
+
+fn default_telegram_api_base() -> String {
+    "https://api.telegram.org".into()
+}
+
+impl TelegramConfig {
+    pub fn is_configured(&self) -> bool {
+        matches!(
+            (&self.bot_token, &self.chat_id),
+            (Some(t), Some(c)) if !t.is_empty() && !c.is_empty()
+        )
+    }
+
+    /// Normalized API base without trailing slash.
+    pub fn api_base_url(&self) -> &str {
+        self.api_base.trim_end_matches('/')
+    }
+}
 fn default_panel_addr() -> String {
     "0.0.0.0:9080".into()
 }
@@ -448,6 +654,15 @@ impl Default for AppConfig {
             tls_listen: Vec::new(),
             http_listen: Vec::new(),
             upstream_proxy: UpstreamProxy::default(),
+            upstreams: HashMap::new(),
+            default_upstream: None,
+            client_upstreams: HashMap::new(),
+            upstream_failover: false,
+            client_whitelist: Vec::new(),
+            client_whitelist_ufw: true,
+            ufw_bin: None,
+            upstream_monitor: UpstreamMonitorConfig::default(),
+            telegram: TelegramConfig::default(),
             connect_timeout_secs: default_connect_timeout(),
             upstream_probe_wait_secs: default_upstream_probe_wait_secs(),
             upstream_probe_interval_secs: default_upstream_probe_interval_secs(),
@@ -499,12 +714,13 @@ impl AppConfig {
             let mut cfg: AppConfig = serde_yaml::from_str(&content)
                 .with_context(|| format!("Failed to parse config file: {path}"))?;
 
-            // Env vars take precedence over file
+            // Env vars take precedence over file (default profile only).
             if let Some(proxy) = from_env.upstream_proxy_override {
-                cfg.upstream_proxy = proxy;
+                cfg.apply_default_proxy_override(proxy);
             }
             apply_probe_env_overrides(&mut cfg);
             apply_panel_env_overrides(&mut cfg);
+            apply_monitor_env_overrides(&mut cfg);
             cfg.config_path = Some(path.to_string());
 
             cfg.finalize()?;
@@ -513,21 +729,140 @@ impl AppConfig {
             tracing::warn!("Config file {path} not found, using defaults + env vars");
             let mut cfg = AppConfig::default();
             if let Some(proxy) = from_env.upstream_proxy_override {
-                cfg.upstream_proxy = proxy;
+                cfg.apply_default_proxy_override(proxy);
             }
             apply_probe_env_overrides(&mut cfg);
             apply_panel_env_overrides(&mut cfg);
+            apply_monitor_env_overrides(&mut cfg);
             cfg.config_path = Some(path.to_string());
             cfg.finalize()?;
             Ok(cfg)
         }
     }
 
-    /// Parse listeners and compile the hosts table.
+    /// Override the default upstream profile (`PROXY` / `--proxy`).
+    pub fn apply_default_proxy_override(&mut self, proxy: UpstreamProxy) {
+        self.upstream_proxy = proxy.clone();
+        let name = self
+            .default_upstream
+            .clone()
+            .filter(|n| self.upstreams.contains_key(n) || self.upstreams.is_empty())
+            .unwrap_or_else(|| {
+                if self.upstreams.is_empty() {
+                    "default".into()
+                } else {
+                    self.upstreams
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "default".into())
+                }
+            });
+        if self.upstreams.is_empty() {
+            self.upstreams.insert(name.clone(), proxy);
+            self.default_upstream = Some(name);
+        } else {
+            self.upstreams.insert(name.clone(), proxy);
+            self.default_upstream = Some(name);
+        }
+    }
+
+    /// Parse listeners, normalize multi-upstream maps, compile hosts table.
     pub fn finalize(&mut self) -> Result<()> {
         self.finalize_listeners()?;
+        self.normalize_upstreams()?;
+        self.normalize_client_whitelist();
         self.hosts_table = crate::hosts::compile_hosts_table(&self.hosts)?;
         Ok(())
+    }
+
+    fn normalize_client_whitelist(&mut self) {
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for e in std::mem::take(&mut self.client_whitelist) {
+            match normalize_client_ip(&e.ip) {
+                Some(n) if seen.insert(n.clone()) => {
+                    out.push(WhitelistEntry {
+                        ip: n,
+                        username: e
+                            .username
+                            .as_deref()
+                            .and_then(sanitize_whitelist_username),
+                    });
+                }
+                Some(_) => {}
+                None => tracing::warn!(ip = %e.ip, "dropping invalid client_whitelist entry"),
+            }
+        }
+        self.client_whitelist = out;
+    }
+
+    /// Ensure `upstreams` / `default_upstream` / `client_upstreams` are consistent
+    /// and keep legacy `upstream_proxy` synced to the default profile.
+    pub fn normalize_upstreams(&mut self) -> Result<()> {
+        if self.upstreams.is_empty() {
+            self.upstreams
+                .insert("default".into(), self.upstream_proxy.clone());
+            self.default_upstream = Some("default".into());
+        }
+
+        let default_name = match &self.default_upstream {
+            Some(name) if self.upstreams.contains_key(name) => name.clone(),
+            Some(name) => {
+                bail!(
+                    "default_upstream '{name}' is not in upstreams ({:?})",
+                    self.upstreams.keys().collect::<Vec<_>>()
+                );
+            }
+            None => {
+                // Prefer a profile literally named "default", else first key (stable-ish).
+                if self.upstreams.contains_key("default") {
+                    "default".into()
+                } else {
+                    let mut keys: Vec<_> = self.upstreams.keys().cloned().collect();
+                    keys.sort();
+                    keys.into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("upstreams map is empty"))?
+                }
+            }
+        };
+        self.default_upstream = Some(default_name.clone());
+        self.upstream_proxy = self
+            .upstreams
+            .get(&default_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing default upstream profile"))?;
+
+        // Drop client mappings that point at unknown profiles (warn).
+        let unknown: Vec<_> = self
+            .client_upstreams
+            .iter()
+            .filter(|(_, profile)| !self.upstreams.contains_key(*profile))
+            .map(|(ip, profile)| (ip.clone(), profile.clone()))
+            .collect();
+        for (ip, profile) in unknown {
+            tracing::warn!(
+                client_ip = %ip,
+                profile = %profile,
+                "client_upstreams entry references unknown profile; removing"
+            );
+            self.client_upstreams.remove(&ip);
+        }
+
+        // Canonicalize IP keys where parseable.
+        let raw = std::mem::take(&mut self.client_upstreams);
+        for (ip, profile) in raw {
+            let key = normalize_client_ip(&ip).unwrap_or(ip);
+            self.client_upstreams.insert(key, profile);
+        }
+
+        Ok(())
+    }
+
+    /// Default profile name after normalize.
+    pub fn default_upstream_name(&self) -> &str {
+        self.default_upstream.as_deref().unwrap_or("default")
     }
 
     /// Build the final listener list from `listens` or legacy `tls_listen` + `http_listen`.
@@ -568,13 +903,8 @@ impl AppConfig {
 
     /// Remap loopback upstreams when the gateway resembles a Docker bridge.
     /// Host networking shares the host loopback; gateway detection is heuristic.
+    /// Applies to every named profile in `upstreams` (and synced `upstream_proxy`).
     pub fn remap_docker_loopback_upstream(&mut self) {
-        let Some((host, _)) = self.upstream_proxy.host_port() else {
-            return;
-        };
-        if !is_loopback_host(host) {
-            return;
-        }
         if !Path::new("/.dockerenv").exists() {
             return;
         }
@@ -582,6 +912,15 @@ impl AppConfig {
             .map(|v| v.eq_ignore_ascii_case("off"))
             .unwrap_or(false)
         {
+            return;
+        }
+
+        let any_loopback = self
+            .upstreams
+            .values()
+            .chain(std::iter::once(&self.upstream_proxy))
+            .any(|p| p.host_port().map(|(h, _)| is_loopback_host(h)).unwrap_or(false));
+        if !any_loopback {
             return;
         }
 
@@ -601,29 +940,15 @@ impl AppConfig {
         if !is_docker_bridge_gateway(&gw) {
             tracing::info!(
                 "Docker: default gateway {gw} does not match the bridge heuristic; \
-                 keeping upstream {host} (`--network host` shares the host loopback)"
+                 keeping loopback upstreams (`--network host` shares the host loopback)"
             );
             return;
         }
 
-        match &mut self.upstream_proxy {
-            UpstreamProxy::Socks5 { host, port, .. } | UpstreamProxy::Http { host, port, .. }
-                if is_loopback_host(host) =>
-            {
-                let old = host.clone();
-                let port = *port;
-                tracing::info!(
-                    "Docker: remapping upstream proxy {old}:{port} → {gw}:{port} \
-                     (127.0.0.1 inside a container is not the host)"
-                );
-                tracing::warn!(
-                    "Host SOCKS/HTTP proxy must listen on 0.0.0.0:{port} or {gw}:{port}, \
-                     or run sniproxy with `docker run --network host`"
-                );
-                *host = gw;
-            }
-            _ => {}
+        for (name, proxy) in self.upstreams.iter_mut() {
+            remap_proxy_loopback_host(proxy, &gw, Some(name));
         }
+        remap_proxy_loopback_host(&mut self.upstream_proxy, &gw, None);
     }
 
     fn from_env() -> EnvOverrides {
@@ -660,6 +985,66 @@ pub fn parse_proxy_string(s: &str) -> Result<UpstreamProxy> {
             Ok(UpstreamProxy::Http { host, port, auth: None })
         }
         other => bail!("Unknown proxy type '{}'. Expected socks5 or http", other),
+    }
+}
+
+fn apply_monitor_env_overrides(cfg: &mut AppConfig) {
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_ENABLED") {
+        cfg.upstream_monitor.enabled = matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_INTERVAL_SECS") {
+        if let Ok(secs) = v.parse::<u64>() {
+            cfg.upstream_monitor.interval_secs = secs.max(15);
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_TIMEOUT_SECS") {
+        if let Ok(secs) = v.parse::<u64>() {
+            cfg.upstream_monitor.timeout_secs = secs.max(1);
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_FAIL_THRESHOLD") {
+        if let Ok(n) = v.parse::<u32>() {
+            cfg.upstream_monitor.fail_threshold = n.max(1);
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_PROBE_HOST") {
+        if !v.is_empty() {
+            cfg.upstream_monitor.probe_host = v;
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_PROBE_PORT") {
+        if let Ok(p) = v.parse::<u16>() {
+            cfg.upstream_monitor.probe_port = p;
+        }
+    }
+    if let Ok(v) = std::env::var("UPSTREAM_MONITOR_PROBE_HOSTS") {
+        let list: Vec<String> = v
+            .split(|c| c == ',' || c == ' ')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !list.is_empty() {
+            cfg.upstream_monitor.probe_hosts = list;
+        }
+    }
+    if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        if !v.is_empty() {
+            cfg.telegram.bot_token = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("TELEGRAM_CHAT_ID") {
+        if !v.is_empty() {
+            cfg.telegram.chat_id = Some(v);
+        }
+    }
+    if let Ok(v) = std::env::var("TELEGRAM_API_BASE") {
+        if !v.is_empty() {
+            cfg.telegram.api_base = v.trim_end_matches('/').to_string();
+        }
     }
 }
 
@@ -742,6 +1127,32 @@ fn apply_panel_env_overrides(cfg: &mut AppConfig) {
             cfg.panel.dnsmasq_reload_cmd = Some(v);
         }
     }
+    if let Ok(v) = std::env::var("CLIENT_WHITELIST_UFW") {
+        cfg.client_whitelist_ufw = matches!(
+            v.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(v) = std::env::var("UFW_BIN") {
+        if !v.is_empty() {
+            cfg.ufw_bin = Some(v);
+        }
+    }
+    // Auto-detect dnsmasq drop-in dir when unset but present (e.g. mounted volume).
+    if cfg
+        .panel
+        .dnsmasq_conf_dir
+        .as_ref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        for candidate in ["/etc/dnsmasq.d", "/usr/local/etc/dnsmasq.d"] {
+            if std::path::Path::new(candidate).is_dir() {
+                cfg.panel.dnsmasq_conf_dir = Some(candidate.into());
+                break;
+            }
+        }
+    }
     // Auto-detect common dnsmasq query log when unset but present (e.g. mounted volume).
     if cfg
         .panel
@@ -765,6 +1176,125 @@ fn apply_panel_env_overrides(cfg: &mut AppConfig) {
 
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn remap_proxy_loopback_host(proxy: &mut UpstreamProxy, gateway: &str, profile: Option<&str>) {
+    match proxy {
+        UpstreamProxy::Socks5 { host, port, .. } | UpstreamProxy::Http { host, port, .. }
+            if is_loopback_host(host) =>
+        {
+            let old = host.clone();
+            let port = *port;
+            if let Some(name) = profile {
+                tracing::info!(
+                    "Docker: remapping upstream profile '{name}' {old}:{port} → {gateway}:{port}"
+                );
+            } else {
+                tracing::info!(
+                    "Docker: remapping upstream proxy {old}:{port} → {gateway}:{port} \
+                     (127.0.0.1 inside a container is not the host)"
+                );
+            }
+            tracing::warn!(
+                "Host SOCKS/HTTP proxy must listen on 0.0.0.0:{port} or {gateway}:{port}, \
+                 or run sniproxy with `docker run --network host`"
+            );
+            *host = gateway.to_string();
+        }
+        _ => {}
+    }
+}
+
+/// Canonicalize a client IP string for map lookups (IPv4/IPv6).
+pub fn normalize_client_ip(ip: &str) -> Option<String> {
+    let s = ip.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|a| a.to_string())
+}
+
+/// One whitelist row: IP plus optional username (stored in UFW comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhitelistEntry {
+    pub ip: String,
+    pub username: Option<String>,
+}
+
+impl WhitelistEntry {
+    pub fn ip_only(ip: impl Into<String>) -> Self {
+        Self {
+            ip: ip.into(),
+            username: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WhitelistEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Ip(String),
+            Obj {
+                ip: String,
+                #[serde(default)]
+                username: Option<String>,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Ip(ip) => Ok(Self {
+                ip,
+                username: None,
+            }),
+            Raw::Obj { ip, username } => Ok(Self {
+                ip,
+                username: username.and_then(|u| sanitize_whitelist_username(&u)),
+            }),
+        }
+    }
+}
+
+impl Serialize for WhitelistEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match &self.username {
+            Some(u) if !u.is_empty() => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("ip", &self.ip)?;
+                map.serialize_entry("username", u)?;
+                map.end()
+            }
+            _ => serializer.serialize_str(&self.ip),
+        }
+    }
+}
+
+/// Sanitize username for UFW comments / API.
+/// Allows letters, digits, and `._@+-`. Max 32 chars. Empty → None.
+pub fn sanitize_whitelist_username(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let cleaned: String = s
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '+' | '-'))
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 /// True when the default route points at Docker's bridge (not the host's public gateway).

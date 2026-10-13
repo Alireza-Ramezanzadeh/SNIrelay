@@ -39,7 +39,9 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     libssl3 \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user (optional; container defaults to root for :80/:443)

@@ -27,8 +27,10 @@ use std::sync::atomic::AtomicBool;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
+use crate::client_acl::SharedClientAcl;
 use crate::config::AppConfig;
 use crate::hosts::HostsTable;
+use crate::upstream_registry::SharedUpstreamRegistry;
 
 use api::api_router;
 
@@ -45,12 +47,16 @@ pub struct PanelState {
     pub upstream_ok: Arc<AtomicBool>,
     pub hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
     pub hosts_entries: Arc<parking_lot::RwLock<Vec<crate::hosts::HostsEntry>>>,
+    pub upstream_registry: SharedUpstreamRegistry,
+    pub client_acl: SharedClientAcl,
     pub config_path: PathBuf,
 }
 
 pub async fn start_panel(
     cfg: Arc<AppConfig>,
     upstream_ok: Arc<AtomicBool>,
+    upstream_registry: SharedUpstreamRegistry,
+    client_acl: SharedClientAcl,
 ) -> Result<(TrafficAggregator, Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>)> {
     let panel = &cfg.panel;
     if !panel.enabled {
@@ -80,6 +86,8 @@ pub async fn start_panel(
         upstream_ok,
         hosts_live: hosts_live.clone(),
         hosts_entries: hosts_entries.clone(),
+        upstream_registry,
+        client_acl,
         config_path,
     };
 

@@ -20,6 +20,11 @@ mod self_loop;
 mod sni;
 mod service;
 mod metrics;
+mod upstream_registry;
+mod upstream_monitor;
+mod client_acl;
+mod ufw;
+mod telegram;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -93,15 +98,31 @@ async fn main() -> Result<()> {
         "configuration/defaults"
     };
 
-    // CLI --proxy overrides config file
+    // CLI --proxy overrides the default upstream profile only
     if let Some(proxy_str) = cli.proxy {
-        cfg.upstream_proxy = crate::config::parse_proxy_string(&proxy_str)?;
+        cfg.apply_default_proxy_override(crate::config::parse_proxy_string(&proxy_str)?);
+        cfg.normalize_upstreams()?;
     }
 
     cfg.remap_docker_loopback_upstream();
 
     info!("Starting SNIrelay v{}", env!("CARGO_PKG_VERSION"));
-    info!(source = upstream_source, "Upstream proxy: {}", cfg.upstream_proxy);
+    info!(
+        source = upstream_source,
+        default = cfg.default_upstream_name(),
+        profiles = cfg.upstreams.len(),
+        client_routes = cfg.client_upstreams.len(),
+        "Upstream proxy: {} (default profile)",
+        cfg.upstream_proxy
+    );
+    for (name, proxy) in &cfg.upstreams {
+        let marker = if name == cfg.default_upstream_name() {
+            " [default]"
+        } else {
+            ""
+        };
+        info!("  upstream profile '{name}'{marker}: {proxy}");
+    }
     for listener in &cfg.listens {
         info!(
             "Configured listener [{}] {} proto={} (not bound yet)",
@@ -133,7 +154,8 @@ async fn main() -> Result<()> {
         wait_secs = cfg.upstream_probe_wait_secs,
         interval_secs = cfg.upstream_probe_interval_secs.max(1),
         required = cfg.upstream_probe_required,
-        "Checking upstream before binding listeners"
+        default = cfg.default_upstream_name(),
+        "Checking default upstream before binding listeners"
     );
     let upstream_ready = crate::proxy_connector::ensure_upstream_ready(
         &cfg.upstream_proxy,
@@ -143,6 +165,18 @@ async fn main() -> Result<()> {
         cfg.upstream_probe_required,
     )
     .await?;
+
+    // Soft-probe other named profiles (warn only).
+    let default_name = cfg.default_upstream_name().to_string();
+    for (name, proxy) in &cfg.upstreams {
+        if name == &default_name {
+            continue;
+        }
+        match crate::proxy_connector::probe_upstream(proxy, probe_timeout).await {
+            Ok(()) => info!(profile = %name, "Upstream profile reachable"),
+            Err(e) => tracing::warn!(profile = %name, error = %e, "Upstream profile unreachable"),
+        }
+    }
 
     let process_limits = limits::apply(&cfg)?;
     info!(
@@ -155,10 +189,28 @@ async fn main() -> Result<()> {
         metrics::start_metrics_server(metrics_addr.clone(), cfg.metrics_refresh_secs).await?;
     }
 
+    let upstream_registry = crate::upstream_registry::shared_from_config(&cfg);
+    let client_acl = crate::client_acl::shared_from_config(&cfg);
+    if client_acl.read().is_open() {
+        info!("Client whitelist: open (all IPs allowed)");
+    } else {
+        info!(
+            count = client_acl.read().len(),
+            ufw_sync = client_acl.read().ufw_sync(),
+            "Client whitelist ACL active"
+        );
+    }
     let cfg = Arc::new(cfg);
     let upstream_ok = Arc::new(AtomicBool::new(upstream_ready));
-    let (traffic, hosts_live) =
-        crate::panel::start_panel(cfg.clone(), upstream_ok.clone()).await?;
+    let (traffic, hosts_live) = crate::panel::start_panel(
+        cfg.clone(),
+        upstream_ok.clone(),
+        upstream_registry.clone(),
+        client_acl.clone(),
+    )
+    .await?;
+
+    crate::upstream_monitor::start(cfg.clone(), upstream_registry.clone());
 
     // ── Run service ──────────────────────────────────────────────────────────
     let service = SniProxyService::new(
@@ -166,6 +218,8 @@ async fn main() -> Result<()> {
         process_limits.max_connections,
         Some(traffic),
         hosts_live,
+        upstream_registry,
+        client_acl,
     );
     service.run().await
 }

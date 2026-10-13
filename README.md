@@ -38,6 +38,7 @@ It never decrypts TLS. Client certificates, ALPN, and HTTP/2 negotiation stay en
 - **TLS passthrough** — Parse SNI from `ClientHello` only; replay the exact handshake bytes upstream
 - **HTTP & HTTPS** — Multiple listeners (443, 80, 8080, custom ports) in one config file
 - **Upstream tunneling** — SOCKS5 (with optional auth) or HTTP `CONNECT`; `direct` mode for testing
+- **Multi-upstream** — Named SOCKS/HTTP profiles + per-client-IP routing (`client_upstreams`); editable in the panel
 - **Hosts allowlist** — Sniproxy-style `table hosts`: which domains may relay + optional IP override
 - **Built for heavy traffic** — Connection limits tied to `RLIMIT_NOFILE`, listen backlog, non-blocking metrics snapshots
 - **Prometheus metrics** — Global and per-`client_ip` / `domain` / `upstream` breakdown
@@ -146,13 +147,42 @@ Example: [`config/config.yaml`](config/config.yaml)
 
 | Section | Purpose |
 |--------|---------|
-| `upstream_proxy` | SOCKS5, HTTP CONNECT, or `direct` |
+| `upstream_proxy` | Legacy/default SOCKS5, HTTP CONNECT, or `direct` |
+| `upstreams` | Named profiles (e.g. `middle-east`, `europe`) |
+| `default_upstream` | Profile for unmapped client IPs |
+| `client_upstreams` | Exact client IP → profile name |
+| `upstream_failover` | Optional: try other profiles if preferred SOCKS fails (default `false`) |
+| `client_whitelist` | Exact client IPs allowed on proxy ports (empty = allow all) |
+| `client_whitelist_ufw` | Sync whitelist add/remove to host UFW (default `true`) |
 | `listens` | Bind addresses and `proto: tls \| http` |
 | `hosts` | Allowlist (regex patterns) + DNS/IP (`address: "*"` = use client hostname) |
 | `max_connections` | Concurrent sessions (capped from open-file limit) |
 | `nofile_limit` | Raise `RLIMIT_NOFILE` at startup |
 | `metrics_addr` | Prometheus scrape endpoint (e.g. `:9090`) |
 | `metrics_refresh_secs` | Background `/metrics` snapshot interval |
+
+**Multi-upstream example:**
+
+```yaml
+upstreams:
+  middle-east:
+    type: socks5
+    host: "127.0.0.1"
+    port: 10808
+  europe:
+    type: socks5
+    host: "10.0.0.2"
+    port: 1080
+
+default_upstream: middle-east
+
+client_upstreams:
+  "94.183.122.121": europe
+```
+
+`PROXY` / `--proxy` still overrides **only** the default profile. Old configs with a single `upstream_proxy` keep working (synthesized as profile `default`). Edit profiles and IP map live in the panel **Upstreams** tab (persists to `config.yaml`).
+
+Optional **`upstream_failover: true`** (default `false`): if the preferred profile fails to connect, try `default_upstream` then the remaining profiles. Toggle from the panel as well.
 
 **Hosts example:**
 
@@ -203,9 +233,11 @@ SNIrelay embeds a bilingual (EN/FA) admin UI on **`:9080`** (configurable via `p
 | Feature | Description |
 |---------|-------------|
 | Dashboard | Active sessions, bytes, upstream health, daily traffic chart |
-| Traffic by IP | Upload/download/sessions per client IP (+ per-domain drill-down) |
+| Traffic by IP | Upload/download/sessions per client IP (+ assigned upstream) |
 | Domains | CRUD + bulk import for dnsmasq → snirelay routing |
 | Query log | AdGuard-style DNS queries from dnsmasq (`log-queries`) |
+| Upstreams | Named SOCKS profiles + per-IP routing (YAML persist / hot-reload) |
+| Whitelist | Client IP ACL + optional UFW `allow/delete from` sync |
 | dnsmasq | Export / Apply `address=/domain/RELAY_IP` snippet |
 | Hosts | Hot-reload SNIrelay `hosts` allowlist |
 | Auth | Cookie session; set `ADMIN_PASSWORD` (default `snirelay`) |
@@ -264,27 +296,18 @@ docker run -d --name snirelay --restart unless-stopped \
 
 **Upstream on localhost** — use `docker run --network host` or bind Xray to `0.0.0.0:10808`.
 
-**Compose configuration mount** — the entrypoint reads `/etc/sniproxy/config.yaml` by default:
+**Compose** — see [`docker-compose.yml`](docker-compose.yml):
 
-```yaml
-services:
-  snirelay:
-    image: alirezaramezanzadeh/snirelay:0.3.0
-    network_mode: host
-    environment:
-      ADMIN_PASSWORD: change-me
-      RELAY_IP: "94.182.174.181"
-    volumes:
-      - ./snirelay/config.yaml:/etc/sniproxy/config.yaml
-      - snirelay-data:/var/lib/snirelay
+```bash
+cp config/config.yaml ./snirelay.yaml
+cp .env.sample .env          # set ADMIN_PASSWORD / RELAY_IP
+docker compose up -d --build
 ```
 
-If mounting at `/app/config.yaml`, also set `CONFIG_FILE: /app/config.yaml` under
-`environment`. Otherwise the bundled configuration remains active. After changing
-the mount or environment, recreate the service with
-`docker compose up -d --force-recreate snirelay`. `--proxy` overrides `PROXY`, which
-overrides YAML. Startup logs report the configuration path and effective upstream
-source without proxy credentials.
+Stable settings live in `snirelay.yaml`; secrets and machine overrides in `.env`
+(see [`.env.sample`](.env.sample)). After changing the mount or env, recreate with
+`docker compose up -d --force-recreate`. `PROXY` / `--proxy` overrides the default
+upstream profile only.
 
 **Heavy traffic tuning:**
 

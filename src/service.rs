@@ -28,6 +28,8 @@ use crate::panel::TrafficAggregator;
 use crate::proxy_connector;
 use crate::self_loop::SelfLoopGuard;
 use crate::sni::{self, PeekResult};
+use crate::client_acl::SharedClientAcl;
+use crate::upstream_registry::SharedUpstreamRegistry;
 
 // ── Top-level service ─────────────────────────────────────────────────────────
 
@@ -38,6 +40,8 @@ pub struct SniProxyService {
     self_loop: Arc<SelfLoopGuard>,
     traffic: Option<TrafficAggregator>,
     hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
+    upstream_registry: SharedUpstreamRegistry,
+    client_acl: SharedClientAcl,
 }
 
 impl SniProxyService {
@@ -46,6 +50,8 @@ impl SniProxyService {
         max_connections: usize,
         traffic: Option<TrafficAggregator>,
         hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
+        upstream_registry: SharedUpstreamRegistry,
+        client_acl: SharedClientAcl,
     ) -> Self {
         let domain_limiter = if cfg.domain_limits.is_empty() {
             None
@@ -76,6 +82,8 @@ impl SniProxyService {
             self_loop,
             traffic,
             hosts_live,
+            upstream_registry,
+            client_acl,
         }
     }
 
@@ -87,6 +95,8 @@ impl SniProxyService {
         let self_loop = self.self_loop.clone();
         let traffic = self.traffic.clone();
         let hosts_live = self.hosts_live.clone();
+        let upstream_registry = self.upstream_registry.clone();
+        let client_acl = self.client_acl.clone();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let persist_interval = Duration::from_secs(cfg.domain_limits_persist_secs);
@@ -121,6 +131,8 @@ impl SniProxyService {
             let loop_guard = self_loop.clone();
             let traffic2 = traffic.clone();
             let hosts2 = hosts_live.clone();
+            let upstreams2 = upstream_registry.clone();
+            let acl2 = client_acl.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = run_listener(
@@ -136,6 +148,8 @@ impl SniProxyService {
                     loop_guard,
                     traffic2,
                     hosts2,
+                    upstreams2,
+                    acl2,
                 )
                 .await
                 {
@@ -256,6 +270,8 @@ async fn run_listener(
     self_loop: Arc<SelfLoopGuard>,
     traffic: Option<TrafficAggregator>,
     hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
+    upstream_registry: SharedUpstreamRegistry,
+    client_acl: SharedClientAcl,
 ) -> Result<()> {
     let listener = bind_listener(&addr, backlog)
         .await
@@ -291,6 +307,8 @@ async fn run_listener(
                         let loop_guard2 = self_loop.clone();
                         let traffic2 = traffic.clone();
                         let hosts2 = hosts_live.clone();
+                        let upstreams2 = upstream_registry.clone();
+                        let acl2 = client_acl.clone();
 
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -304,6 +322,8 @@ async fn run_listener(
                                 loop_guard2,
                                 traffic2,
                                 hosts2,
+                                upstreams2,
+                                acl2,
                             )
                             .await
                             {
@@ -335,13 +355,23 @@ async fn handle_connection(
     self_loop: Arc<SelfLoopGuard>,
     traffic: Option<TrafficAggregator>,
     hosts_live: Arc<parking_lot::RwLock<Option<Arc<HostsTable>>>>,
+    upstream_registry: SharedUpstreamRegistry,
+    client_acl: SharedClientAcl,
 ) -> Result<()> {
     let connect_timeout = Duration::from_secs(cfg.connect_timeout_secs);
     let mut labels = TargetLabels::unknown();
     labels.set_client_ip_from_peer(&peer);
+    let client_ip = labels.client_ip.clone();
     let mut opened = false;
 
     let result: Result<()> = async {
+        // ── Client IP whitelist (empty list = allow all) ──────────────────────
+        if !client_acl.read().is_allowed(&client_ip) {
+            warn!("Rejecting {peer}: client IP not in whitelist");
+            metrics::connection_rejected(&labels, "acl_deny");
+            return Ok(());
+        }
+
         // ── Peek to extract hostname ──────────────────────────────────────────
         let (hostname, port, peeked_bytes, client_overflow) = match proto.as_str() {
             "tls" => extract_tls_info(&mut client, &cfg, listen_port).await?,
@@ -408,19 +438,55 @@ async fn handle_connection(
             );
         }
 
-        // ── Connect upstream ──────────────────────────────────────────────────
-        let mut upstream = proxy_connector::connect(
-            &cfg.upstream_proxy,
-            &final_host,
-            final_port,
-            connect_timeout,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Upstream connect to {final_host}:{final_port} via {} failed",
-                cfg.upstream_proxy
-            )
+        // ── Select upstream profile(s) by client IP (+ optional failover) ─────
+        let candidates = {
+            let reg = upstream_registry.read();
+            reg.connect_candidates(&client_ip).with_context(|| {
+                format!("resolve upstream profile for client_ip={client_ip}")
+            })?
+        };
+        let failover = candidates.len() > 1;
+
+        // ── Connect upstream (try fallbacks when upstream_failover is on) ─────
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut upstream = None;
+        let mut profile_name = String::new();
+        let mut upstream_proxy_display = String::new();
+
+        for (name, proxy) in &candidates {
+            match proxy_connector::connect(proxy, &final_host, final_port, connect_timeout).await {
+                Ok(stream) => {
+                    if let Some(prev) = last_err.take() {
+                        warn!(
+                            "Upstream profile '{}' failed for {peer} → {final_host}:{final_port}; \
+                             failover to '{name}' ({proxy}): {prev:#}",
+                            candidates[0].0
+                        );
+                    }
+                    profile_name = name.clone();
+                    upstream_proxy_display = proxy.to_string();
+                    upstream = Some(stream);
+                    break;
+                }
+                Err(e) => {
+                    if failover {
+                        warn!(
+                            "Upstream profile '{name}' ({proxy}) failed for {peer} → {final_host}:{final_port}: {e:#}"
+                        );
+                    }
+                    last_err = Some(e.context(format!(
+                        "via profile '{name}' ({proxy})"
+                    )));
+                }
+            }
+        }
+
+        let mut upstream = upstream.ok_or_else(|| {
+            last_err.unwrap_or_else(|| {
+                anyhow::anyhow!("no upstream profiles available for client_ip={client_ip}")
+            })
+        }).with_context(|| {
+            format!("Upstream connect to {final_host}:{final_port} failed")
         })?;
 
         metrics::connection_opened(&labels);
@@ -428,13 +494,11 @@ async fn handle_connection(
 
         if mapped_from_hosts && final_host != hostname {
             info!(
-                "Proxying {peer} → {final_host}:{final_port} (hosts map for {hostname}) via {}",
-                cfg.upstream_proxy
+                "Proxying {peer} → {final_host}:{final_port} (hosts map for {hostname}) via profile '{profile_name}' ({upstream_proxy_display})"
             );
         } else {
             info!(
-                "Proxying {peer} → {final_host}:{final_port} via {}",
-                cfg.upstream_proxy
+                "Proxying {peer} → {final_host}:{final_port} via profile '{profile_name}' ({upstream_proxy_display})"
             );
         }
 

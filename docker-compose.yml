@@ -1,52 +1,38 @@
 # SNIrelay — host network (SOCKS on 127.0.0.1 + ports 80/443)
 #
 # Usage:
-#   1. Copy/edit config:  cp config/config.yaml ./snirelay.yaml
-#   2. Set RELAY_IP / ADMIN_PASSWORD below
+#   1. cp config/config.yaml ./snirelay.yaml   # edit upstreams / hosts / panel
+#   2. cp .env.sample .env                    # set ADMIN_PASSWORD / RELAY_IP
 #   3. docker compose up -d --build
 #
-# Panel:  http://SERVER:9080/
+# Panel:   http://SERVER:9080/
 # Metrics: http://SERVER:9090/metrics
+#
+# Whitelist → UFW + dnsmasq HUP: uses `nsenter -t 1` into the host
+# (needs pid: host + privileged + util-linux in the image).
 
 services:
   snirelay:
     build: .
-    image: snirelay:0.3.0
+    image: docker.io/alirezaramezanzadeh/snirelay:0.4.0
     container_name: snirelay
     restart: unless-stopped
     network_mode: host
-    # So kill -HUP can signal host dnsmasq after Apply in the panel
+    # Host PID 1 for dnsmasq HUP + nsenter → host ufw
     pid: host
+    privileged: true
     ulimits:
       nofile:
         soft: 1048576
         hard: 1048576
-    environment:
-      CONFIG_FILE: /etc/sniproxy/config.yaml
-      LOG_LEVEL: info
-      PROXY: "socks5 127.0.0.1 10808"
-      ADMIN_PASSWORD: "change-me"
-      # Public IP clients use to reach this SNIrelay (written into dnsmasq snippets)
-      RELAY_IP: "94.182.174.181"
-      DNSMASQ_CONF_DIR: /etc/dnsmasq.d
-      # Optional — auto-detected as the .conf with most address=/ and bypass.conf
-      # DNSMASQ_RELAY_FILE: /etc/dnsmasq.d/routed.conf
-      # DNSMASQ_BYPASS_FILE: /etc/dnsmasq.d/bypass.conf
-      DNSMASQ_RELOAD_CMD: "kill -HUP $$(pidof dnsmasq)"
-      # Host path must match dnsmasq log-facility=… (see README)
-      DNSMASQ_QUERY_LOG: /var/log/dnsmasq/queries.log
-      DNS_QUERY_RETAIN_HOURS: "72"
-      PANEL_ENABLED: "true"
+    env_file:
+      - .env
     volumes:
       - ./snirelay.yaml:/etc/sniproxy/config.yaml
       - snirelay-data:/var/lib/snirelay
-      # Live read/write of host dnsmasq drop-ins
       - /etc/dnsmasq.d:/etc/dnsmasq.d
       - /etc/dnsmasq.conf:/etc/dnsmasq.conf:ro
-      # dnsmasq query log (create dir + enable log-queries on the host)
       - /var/log/dnsmasq:/var/log/dnsmasq:ro
-    # Optional: if Xray/SOCKS is not up yet, soft-fail probe keeps the container running
-    # UPSTREAM_PROBE_REQUIRED: "false"
 
 volumes:
   snirelay-data:

@@ -1,10 +1,62 @@
 # SNIrelay configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Legacy single upstream (also used as default when `upstreams` is omitted).
 upstream_proxy:
   type: socks5
   host: "127.0.0.1"
   port: 10808
+
+# Named upstream profiles. Unmapped clients use `default_upstream`.
+# PROXY / --proxy overrides only the default profile.
+upstreams:
+  middle-east:
+    type: socks5
+    host: "127.0.0.1"
+    port: 10808
+  # europe:
+  #   type: socks5
+  #   host: "10.0.0.2"
+  #   port: 1080
+
+default_upstream: middle-east
+
+# Exact client IP → profile name
+# client_upstreams:
+#   "94.183.122.121": europe
+client_upstreams: {}
+
+# If preferred SOCKS fails, try other profiles (default → then others). Off by default.
+upstream_failover: false
+
+# Lightweight periodic upstream checks (SOCKS/HTTP handshake only — tiny traffic).
+# Prefer secrets via env: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+upstream_monitor:
+  enabled: false
+  interval_secs: 60
+  timeout_secs: 10
+  fail_threshold: 2
+  recover_threshold: 2
+  notify_recovery: true
+  notify_cooldown_secs: 600
+  # End-to-end HTTPS probe (same idea as: curl --proxy socks5://… https://ifconfig.io)
+  # Avoid relying only on Cloudflare — it often still works when the node is half-dead.
+  probe_host: "ifconfig.io"
+  probe_port: 443
+  # Or require several targets (all must succeed):
+  # probe_hosts: ["ifconfig.io:443", "example.com:443"]
+  # profiles: []   # empty = all non-direct profiles
+
+telegram:
+  # bot_token: ""
+  # chat_id: ""
+  # api_base: "https://api.telegram.org"   # or a proxy mirror
+
+# Client IP whitelist for proxy ports. Empty = allow all. Panel (:9080) is never filtered.
+client_whitelist: []
+# Sync add/remove to host UFW (`ufw allow/delete from <ip>`). Needs ufw in container/host.
+client_whitelist_ufw: true
+# ufw_bin: /usr/sbin/ufw
 
 # Listeners: bind address + proto (tls | http). Routing is only via `hosts` below.
 listens:
@@ -58,6 +110,7 @@ panel:
   # Optional explicit files (auto-detected if omitted):
   # dnsmasq_relay_file: "/etc/dnsmasq.d/routed.conf"
   # dnsmasq_bypass_file: "/etc/dnsmasq.d/bypass.conf"
+  # Host signal; container wraps this in `nsenter -t 1` automatically when Docker+pid:host
   dnsmasq_reload_cmd: "kill -HUP $(pidof dnsmasq)"
   # AdGuard-style query log: enable in dnsmasq (log-queries + log-facility=file)
   dnsmasq_query_log: "/var/log/dnsmasq/queries.log"

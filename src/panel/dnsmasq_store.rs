@@ -1,10 +1,12 @@
 //! Read/write dnsmasq `address=` and bypass `server=/domain/#` rules from conf files.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use tracing::{info, warn};
 
 /// One managed DNS routing rule from dnsmasq.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +44,11 @@ impl DnsmasqPaths {
                     .and_then(|p| Path::new(p).parent().map(|d| d.to_path_buf()))
             })?;
         if !dir.is_dir() {
+            tracing::warn!(
+                path = %dir.display(),
+                "dnsmasq_conf_dir is set but not a directory inside the container \
+                 (mount host /etc/dnsmasq.d or create the path)"
+            );
             return None;
         }
         let relay_ip = panel
@@ -317,16 +324,72 @@ fn render_bypass_lines(domains: &BTreeSet<String>) -> String {
     out
 }
 
+fn in_docker() -> bool {
+    Path::new("/.dockerenv").exists()
+}
+
+fn nsenter_bin() -> Option<&'static str> {
+    for p in ["/usr/bin/nsenter", "/bin/nsenter"] {
+        if Path::new(p).exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Reload host dnsmasq after writing drop-ins.
+///
+/// Inside Docker, plain `kill -HUP $(pidof dnsmasq)` often fails with
+/// `Permission denied` even with `pid: host` — signal the host process via
+/// `nsenter -t 1` (same pattern as UFW sync).
 pub fn reload(paths: &DnsmasqPaths) -> Result<Option<bool>> {
     let Some(cmd) = &paths.reload_cmd else {
         return Ok(None);
     };
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .status()
-        .with_context(|| format!("run reload cmd: {cmd}"))?;
-    Ok(Some(status.success()))
+
+    let output = if in_docker() {
+        if let Some(ns) = nsenter_bin() {
+            // mount+net only — skip IPC/UTS (some hosts deny /proc/1/ns/ipc)
+            Command::new(ns)
+                .args(["-t", "1", "-m", "-n", "--", "sh", "-c", cmd])
+                .output()
+                .with_context(|| {
+                    format!(
+                        "nsenter -t 1 -m -n -- sh -c {cmd:?} (needs privileged + pid: host)"
+                    )
+                })?
+        } else {
+            warn!("Docker detected but nsenter missing; dnsmasq reload may fail (install util-linux)");
+            Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .with_context(|| format!("run reload cmd: {cmd}"))?
+        }
+    } else {
+        Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .output()
+            .with_context(|| format!("run reload cmd: {cmd}"))?
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        info!(%cmd, "dnsmasq reload ok");
+        Ok(Some(true))
+    } else {
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit {}", output.status)
+        };
+        warn!(%cmd, error = %detail, "dnsmasq reload failed");
+        Ok(Some(false))
+    }
 }
 
 #[cfg(test)]

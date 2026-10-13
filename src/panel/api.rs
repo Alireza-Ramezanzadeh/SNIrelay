@@ -3,7 +3,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{Duration as ChronoDuration, Utc};
 use rand::RngCore;
@@ -12,8 +12,14 @@ use serde::{Deserialize, Serialize};
 use super::db::render_dnsmasq;
 use super::dnsmasq_store::{self, DnsDomain, DnsmasqPaths};
 use super::{hash_password, session_token_from_headers, verify_password, PanelState};
+use crate::client_acl::{require_username, ClientAcl};
+use crate::config::WhitelistEntry;
+use crate::config::UpstreamProxy;
 use crate::hosts::{compile_hosts_table, HostsEntry};
 use crate::metrics;
+use crate::upstream_registry::UpstreamRegistry;
+use crate::ufw;
+use std::collections::HashMap;
 
 fn new_session_token() -> String {
     let mut bytes = [0u8; 32];
@@ -66,6 +72,15 @@ pub fn api_router() -> Router<PanelState> {
         .route("/api/dns/queries/top", get(dns_queries_top))
         .route("/api/config/summary", get(config_summary))
         .route("/api/hosts", get(get_hosts).put(put_hosts))
+        .route("/api/upstreams", get(get_upstreams).put(put_upstreams))
+        .route("/api/upstreams/client", post(add_client_upstream))
+        .route(
+            "/api/upstreams/client/{ip}",
+            delete(delete_client_upstream),
+        )
+        .route("/api/whitelist", get(get_whitelist).put(put_whitelist))
+        .route("/api/whitelist/{ip}", delete(delete_whitelist_ip))
+        .route("/api/whitelist/add", post(add_whitelist_ip))
 }
 
 fn unauthorized() -> impl IntoResponse {
@@ -329,8 +344,24 @@ async fn list_domains(State(state): State<PanelState>, headers: HeaderMap) -> im
                 .into_response(),
         };
     }
+    let configured = state.cfg.panel.dnsmasq_conf_dir.clone();
+    let hint = match configured.as_deref() {
+        Some(p) if !p.is_empty() => format!(
+            "Configured dnsmasq_conf_dir={p} but it is missing inside the container. \
+             Mount host path: -v /etc/dnsmasq.d:/etc/dnsmasq.d"
+        ),
+        _ => "Set panel.dnsmasq_conf_dir: \"/etc/dnsmasq.d\" in snirelay.yaml \
+              (or DNSMASQ_CONF_DIR=/etc/dnsmasq.d) and mount /etc/dnsmasq.d into the container."
+            .into(),
+    };
     match state.db.list_domains() {
-        Ok(items) => Json(serde_json::json!({"source": "sqlite", "items": items})).into_response(),
+        Ok(items) => Json(serde_json::json!({
+            "source": "sqlite",
+            "items": items,
+            "dnsmasq_hint": hint,
+            "dnsmasq_conf_dir": configured,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -890,8 +921,18 @@ async fn config_summary(State(state): State<PanelState>, headers: HeaderMap) -> 
             })
         })
         .collect();
+    let reg = state.upstream_registry.read();
+    let upstream_profiles: serde_json::Map<String, serde_json::Value> = reg
+        .profiles()
+        .iter()
+        .map(|(k, v)| (k.clone(), proxy_public_json(v)))
+        .collect();
     Json(serde_json::json!({
         "upstream": state.cfg.upstream_proxy.to_string(),
+        "default_upstream": reg.default_name(),
+        "upstream_failover": reg.failover_enabled(),
+        "upstreams": upstream_profiles,
+        "client_upstreams": reg.client_upstreams().clone(),
         "listens": listens,
         "hosts": state.hosts_entries.read().clone(),
         "panel": {
@@ -977,6 +1018,541 @@ fn persist_hosts_yaml(path: &std::path::Path, hosts: &[HostsEntry]) -> anyhow::R
     let hosts_val = serde_yaml::to_value(hosts).context("serialize hosts")?;
     if let serde_yaml::Value::Mapping(ref mut map) = value {
         map.insert(serde_yaml::Value::String("hosts".into()), hosts_val);
+    } else {
+        anyhow::bail!("config root is not a mapping");
+    }
+    let out = serde_yaml::to_string(&value)?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn proxy_public_json(proxy: &UpstreamProxy) -> serde_json::Value {
+    match proxy {
+        UpstreamProxy::Socks5 {
+            host,
+            port,
+            username,
+            password,
+        } => serde_json::json!({
+            "type": "socks5",
+            "host": host,
+            "port": port,
+            "username": username,
+            "has_password": password.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+        }),
+        UpstreamProxy::Http { host, port, auth } => serde_json::json!({
+            "type": "http",
+            "host": host,
+            "port": port,
+            "has_auth": auth.as_ref().map(|s| !s.is_empty()).unwrap_or(false),
+        }),
+        UpstreamProxy::Direct => serde_json::json!({ "type": "direct" }),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpstreamsPayload {
+    upstreams: HashMap<String, UpstreamProxy>,
+    default_upstream: String,
+    #[serde(default)]
+    client_upstreams: HashMap<String, String>,
+    #[serde(default)]
+    upstream_failover: bool,
+}
+
+async fn get_upstreams(State(state): State<PanelState>, headers: HeaderMap) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let reg = state.upstream_registry.read();
+    let profiles: serde_json::Map<String, serde_json::Value> = reg
+        .profiles()
+        .iter()
+        .map(|(k, v)| (k.clone(), proxy_public_json(v)))
+        .collect();
+    Json(serde_json::json!({
+        "upstreams": profiles,
+        "default_upstream": reg.default_name(),
+        "client_upstreams": reg.client_upstreams().clone(),
+        "upstream_failover": reg.failover_enabled(),
+    }))
+    .into_response()
+}
+
+async fn put_upstreams(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Json(body): Json<UpstreamsPayload>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+
+    // Preserve secrets when the client omits password/auth (UI send without secrets).
+    let mut profiles = body.upstreams;
+    {
+        let current = state.upstream_registry.read();
+        for (name, proxy) in profiles.iter_mut() {
+            if let Some(old) = current.profiles().get(name) {
+                merge_proxy_secrets(proxy, old);
+            }
+        }
+    }
+
+    let registry = match UpstreamRegistry::from_parts(
+        profiles,
+        body.default_upstream.clone(),
+        body.client_upstreams.clone(),
+        body.upstream_failover,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    *state.upstream_registry.write() = registry.clone();
+
+    let persist_msg = match persist_upstreams_yaml(&state.config_path, &registry) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "persist": persist_msg,
+        "default_upstream": registry.default_name(),
+        "upstream_failover": registry.failover_enabled(),
+        "profiles": registry.profiles().len(),
+        "client_routes": registry.client_upstreams().len(),
+        "client_upstreams": registry.client_upstreams().clone(),
+        "note": "upstream routing hot-reloaded for new connections"
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ClientUpstreamBody {
+    ip: String,
+    profile: String,
+}
+
+async fn add_client_upstream(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Json(body): Json<ClientUpstreamBody>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let mut reg = state.upstream_registry.read().clone();
+    if let Err(e) = reg.set_client_upstream(&body.ip, body.profile.trim()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    *state.upstream_registry.write() = reg.clone();
+    let persist_msg = match persist_upstreams_yaml(&state.config_path, &reg) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "persist": persist_msg,
+        "ip": crate::config::normalize_client_ip(&body.ip).unwrap_or(body.ip),
+        "profile": body.profile.trim(),
+        "client_upstreams": reg.client_upstreams().clone(),
+        "default_upstream": reg.default_name(),
+    }))
+    .into_response()
+}
+
+async fn delete_client_upstream(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Path(ip): Path<String>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let mut reg = state.upstream_registry.read().clone();
+    let removed = match reg.remove_client_upstream(&ip) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    *state.upstream_registry.write() = reg.clone();
+    let persist_msg = match persist_upstreams_yaml(&state.config_path, &reg) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "removed": removed,
+        "persist": persist_msg,
+        "client_upstreams": reg.client_upstreams().clone(),
+        "default_upstream": reg.default_name(),
+    }))
+    .into_response()
+}
+
+fn merge_proxy_secrets(new: &mut UpstreamProxy, old: &UpstreamProxy) {
+    match (new, old) {
+        (
+            UpstreamProxy::Socks5 {
+                password: new_pw, ..
+            },
+            UpstreamProxy::Socks5 {
+                password: old_pw, ..
+            },
+        ) => {
+            if new_pw.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                *new_pw = old_pw.clone();
+            }
+        }
+        (
+            UpstreamProxy::Http { auth: new_auth, .. },
+            UpstreamProxy::Http { auth: old_auth, .. },
+        ) => {
+            if new_auth.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+                *new_auth = old_auth.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn persist_upstreams_yaml(
+    path: &std::path::Path,
+    registry: &UpstreamRegistry,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&content).context("parse yaml")?;
+    let upstreams_val = serde_yaml::to_value(registry.profiles()).context("serialize upstreams")?;
+    let default_val = serde_yaml::Value::String(registry.default_name().to_string());
+    // Force string keys so IPs like 94.183.122.121 are never written/parsed as floats.
+    let mut clients_map = serde_yaml::Mapping::new();
+    for (ip, profile) in registry.client_upstreams() {
+        clients_map.insert(
+            serde_yaml::Value::String(ip.clone()),
+            serde_yaml::Value::String(profile.clone()),
+        );
+    }
+    let clients_val = serde_yaml::Value::Mapping(clients_map);
+    let failover_val = serde_yaml::Value::Bool(registry.failover_enabled());
+    let default_proxy = registry
+        .default_proxy()
+        .map(|p| p.clone())
+        .unwrap_or(UpstreamProxy::Direct);
+    let upstream_proxy_val =
+        serde_yaml::to_value(&default_proxy).context("serialize upstream_proxy")?;
+
+    if let serde_yaml::Value::Mapping(ref mut map) = value {
+        map.insert(
+            serde_yaml::Value::String("upstreams".into()),
+            upstreams_val,
+        );
+        map.insert(
+            serde_yaml::Value::String("default_upstream".into()),
+            default_val,
+        );
+        map.insert(
+            serde_yaml::Value::String("client_upstreams".into()),
+            clients_val,
+        );
+        map.insert(
+            serde_yaml::Value::String("upstream_failover".into()),
+            failover_val,
+        );
+        // Keep legacy single-upstream key in sync with default profile.
+        map.insert(
+            serde_yaml::Value::String("upstream_proxy".into()),
+            upstream_proxy_val,
+        );
+    } else {
+        anyhow::bail!("config root is not a mapping");
+    }
+    let out = serde_yaml::to_string(&value)?;
+    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct WhitelistEntryBody {
+    ip: String,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WhitelistPayload {
+    /// Legacy: IP-only list (no usernames).
+    #[serde(default)]
+    ips: Vec<String>,
+    /// Preferred: IP + username rows.
+    #[serde(default)]
+    entries: Vec<WhitelistEntryBody>,
+    #[serde(default)]
+    ufw_sync: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct WhitelistIpBody {
+    ip: String,
+    username: String,
+}
+
+fn whitelist_entries_json(acl: &ClientAcl) -> Vec<serde_json::Value> {
+    acl.as_entries()
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "ip": e.ip,
+                "username": e.username.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+async fn get_whitelist(State(state): State<PanelState>, headers: HeaderMap) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let acl = state.client_acl.read();
+    let ufw_bin = state.cfg.ufw_bin.as_deref();
+    Json(serde_json::json!({
+        "ips": acl.as_vec(),
+        "entries": whitelist_entries_json(&acl),
+        "open": acl.is_open(),
+        "ufw_sync": acl.ufw_sync(),
+        "ufw_available": ufw::ufw_available(ufw_bin),
+        "ufw_bin": state.cfg.ufw_bin,
+        "note": "Empty list = allow all (ACL off). Panel itself is never filtered. UFW comment = snirelay:<username>.",
+    }))
+    .into_response()
+}
+
+async fn put_whitelist(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Json(body): Json<WhitelistPayload>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+
+    let mut rows: Vec<WhitelistEntry> = body
+        .entries
+        .into_iter()
+        .map(|e| WhitelistEntry {
+            ip: e.ip,
+            username: e.username,
+        })
+        .collect();
+    if rows.is_empty() {
+        rows = body
+            .ips
+            .into_iter()
+            .map(WhitelistEntry::ip_only)
+            .collect();
+    }
+
+    let acl = match ClientAcl::from_parts(
+        rows,
+        body.ufw_sync
+            .unwrap_or_else(|| state.client_acl.read().ufw_sync()),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let prev = state.client_acl.read().clone();
+    let ufw_bin = state.cfg.ufw_bin.clone();
+    let do_ufw = acl.ufw_sync();
+
+    let mut ufw_notes = Vec::new();
+    if do_ufw {
+        for e in acl.as_entries() {
+            let user = e.username.as_deref();
+            let was = prev.contains_ip(&e.ip);
+            let same_user = prev.username_for(&e.ip) == user;
+            if !was || !same_user {
+                match ufw::allow_ip(&e.ip, user, ufw_bin.as_deref()) {
+                    Ok(m) => ufw_notes.push(format!("+ {}: {m}", e.ip)),
+                    Err(err) => ufw_notes.push(format!("+ {}: ERROR {err}", e.ip)),
+                }
+            }
+        }
+        for ip in prev.as_vec() {
+            if !acl.contains_ip(&ip) {
+                match ufw::delete_ip(&ip, ufw_bin.as_deref()) {
+                    Ok(m) => ufw_notes.push(format!("- {ip}: {m}")),
+                    Err(e) => ufw_notes.push(format!("- {ip}: ERROR {e}")),
+                }
+            }
+        }
+    }
+
+    let persist_msg = match persist_whitelist_yaml(&state.config_path, &acl) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+    *state.client_acl.write() = acl.clone();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "persist": persist_msg,
+        "ips": acl.as_vec(),
+        "entries": whitelist_entries_json(&acl),
+        "open": acl.is_open(),
+        "ufw_sync": acl.ufw_sync(),
+        "ufw": ufw_notes,
+    }))
+    .into_response()
+}
+
+async fn add_whitelist_ip(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Json(body): Json<WhitelistIpBody>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let username = match require_username(&body.username) {
+        Ok(u) => u,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let mut acl = state.client_acl.read().clone();
+    let (added, user) = match acl.add(&body.ip, &username) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut ufw_note = None;
+    if acl.ufw_sync() {
+        match ufw::allow_ip(&body.ip, Some(&user), state.cfg.ufw_bin.as_deref()) {
+            Ok(m) => ufw_note = Some(m),
+            Err(e) => ufw_note = Some(format!("ERROR: {e}")),
+        }
+    }
+
+    let persist_msg = match persist_whitelist_yaml(&state.config_path, &acl) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+    *state.client_acl.write() = acl.clone();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "added": added,
+        "username": user,
+        "ufw_comment": ufw::rule_comment(Some(&user)),
+        "persist": persist_msg,
+        "ips": acl.as_vec(),
+        "entries": whitelist_entries_json(&acl),
+        "open": acl.is_open(),
+        "ufw": ufw_note,
+    }))
+    .into_response()
+}
+
+async fn delete_whitelist_ip(
+    State(state): State<PanelState>,
+    headers: HeaderMap,
+    Path(ip): Path<String>,
+) -> impl IntoResponse {
+    if require_auth(&state, &headers).await.is_err() {
+        return unauthorized().into_response();
+    }
+    let mut acl = state.client_acl.read().clone();
+    let removed = match acl.remove(&ip) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut ufw_note = None;
+    if removed && acl.ufw_sync() {
+        match ufw::delete_ip(&ip, state.cfg.ufw_bin.as_deref()) {
+            Ok(m) => ufw_note = Some(m),
+            Err(e) => ufw_note = Some(format!("ERROR: {e}")),
+        }
+    }
+
+    let persist_msg = match persist_whitelist_yaml(&state.config_path, &acl) {
+        Ok(()) => "saved".to_string(),
+        Err(e) => format!("hot-reloaded; YAML save failed: {e}"),
+    };
+    *state.client_acl.write() = acl.clone();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "removed": removed,
+        "persist": persist_msg,
+        "ips": acl.as_vec(),
+        "entries": whitelist_entries_json(&acl),
+        "open": acl.is_open(),
+        "ufw": ufw_note,
+    }))
+    .into_response()
+}
+
+fn persist_whitelist_yaml(path: &std::path::Path, acl: &ClientAcl) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&content).context("parse yaml")?;
+
+    let entries_val = serde_yaml::to_value(acl.as_entries()).context("serialize whitelist")?;
+
+    if let serde_yaml::Value::Mapping(ref mut map) = value {
+        map.insert(
+            serde_yaml::Value::String("client_whitelist".into()),
+            entries_val,
+        );
+        map.insert(
+            serde_yaml::Value::String("client_whitelist_ufw".into()),
+            serde_yaml::Value::Bool(acl.ufw_sync()),
+        );
     } else {
         anyhow::bail!("config root is not a mapping");
     }

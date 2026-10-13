@@ -12,9 +12,11 @@ Cargo.lock.bak
 # Secrets & local overrides
 .env
 .env.*
+!.env.sample
 *.pem
 *.key
 config/*.local.yaml
+snirelay.yaml
 
 # Build artifacts
 *.profraw

@@ -116,6 +116,173 @@ pub async fn probe_upstream(proxy: &UpstreamProxy, connect_timeout: Duration) ->
         ))?
 }
 
+/// Runtime health check against one or more probe targets.
+/// **All** targets must succeed (detects partial outages where Cloudflare works
+/// but general HTTPS like `ifconfig.io` dies — the common Xray/VLESS failure mode).
+pub async fn check_upstream(
+    proxy: &UpstreamProxy,
+    connect_timeout: Duration,
+    probes: &[(String, u16)],
+) -> Result<()> {
+    if probes.is_empty() {
+        bail!("no probe targets configured");
+    }
+    for (host, port) in probes {
+        check_upstream_one(proxy, connect_timeout, host, *port).await?;
+    }
+    Ok(())
+}
+
+async fn check_upstream_one(
+    proxy: &UpstreamProxy,
+    connect_timeout: Duration,
+    probe_host: &str,
+    probe_port: u16,
+) -> Result<()> {
+    let started = Instant::now();
+    let mut stream = connect(proxy, probe_host, probe_port, connect_timeout)
+        .await
+        .with_context(|| {
+            format!("upstream tunnel failed for {proxy} → {probe_host}:{probe_port}")
+        })?;
+
+    let remaining = connect_timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        bail!(
+            "upstream check timed out during CONNECT for {proxy} \
+             (tunnel to {probe_host}:{probe_port})"
+        );
+    }
+
+    verify_tunnel_alive(&mut stream, probe_host, probe_port, remaining)
+        .await
+        .with_context(|| {
+            format!(
+                "upstream tunnel opened but probe target did not reply via {proxy} \
+                 ({probe_host}:{probe_port})"
+            )
+        })?;
+
+    drop(stream);
+    Ok(())
+}
+
+/// Prove the tunneled path can carry a full TLS/HTTP response record
+/// (catches mid-handshake EOF — same class of failure as curl's
+/// `unexpected eof while reading`).
+async fn verify_tunnel_alive(
+    stream: &mut TcpStream,
+    probe_host: &str,
+    probe_port: u16,
+    budget: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+
+    let use_tls = probe_port == 443 || probe_port == 8443 || probe_port == 2053;
+    if use_tls {
+        let hello = build_minimal_tls_client_hello(probe_host);
+        timeout(remaining(), stream.write_all(&hello))
+            .await
+            .context("timed out writing TLS ClientHello through tunnel")?
+            .context("failed writing TLS ClientHello through tunnel")?;
+
+        // Full first TLS record (header + body) — not just 1 byte.
+        let mut hdr = [0u8; 5];
+        timeout(remaining(), stream.read_exact(&mut hdr))
+            .await
+            .context("timed out waiting for TLS record header through tunnel")?
+            .context("tunnel closed before TLS reply (unexpected EOF)")?;
+        if hdr[0] != 0x16 && hdr[0] != 0x15 {
+            bail!("unexpected TLS content type 0x{:02x}", hdr[0]);
+        }
+        let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        if rec_len == 0 || rec_len > 16_384 {
+            bail!("invalid TLS record length {rec_len}");
+        }
+        let mut body = vec![0u8; rec_len];
+        timeout(remaining(), stream.read_exact(&mut body))
+            .await
+            .context("timed out waiting for TLS record body through tunnel")?
+            .context("tunnel closed mid-TLS handshake (unexpected EOF)")?;
+    } else {
+        let req = format!(
+            "HEAD / HTTP/1.0\r\nHost: {probe_host}\r\nConnection: close\r\n\r\n"
+        );
+        timeout(remaining(), stream.write_all(req.as_bytes()))
+            .await
+            .context("timed out writing HTTP probe through tunnel")?
+            .context("failed writing HTTP probe through tunnel")?;
+        let mut buf = [0u8; 16];
+        let n = timeout(remaining(), stream.read(&mut buf))
+            .await
+            .context("timed out waiting for HTTP reply through tunnel")?
+            .context("tunnel closed before HTTP reply")?;
+        if n == 0 {
+            bail!("empty HTTP reply through tunnel");
+        }
+        if !buf[..n].windows(5).any(|w| w == b"HTTP/") && buf[0] != b'H' {
+            // Accept partial "HTTP" at start; otherwise still require some data.
+            debug!("HTTP probe got {} non-HTTP bytes (still counted alive)", n);
+        }
+    }
+    Ok(())
+}
+
+/// Minimal TLS 1.2 ClientHello with SNI — enough for most servers to answer.
+fn build_minimal_tls_client_hello(sni_host: &str) -> Vec<u8> {
+    let sni_bytes = sni_host.as_bytes();
+    // Extension: server_name
+    // type(2) + ext_len(2) + list_len(2) + name_type(1) + name_len(2) + name
+    let mut extensions = Vec::with_capacity(9 + sni_bytes.len());
+    extensions.extend_from_slice(&[0x00, 0x00]); // server_name
+    let sni_ext_len = (5 + sni_bytes.len()) as u16;
+    extensions.extend_from_slice(&sni_ext_len.to_be_bytes());
+    let list_len = (3 + sni_bytes.len()) as u16;
+    extensions.extend_from_slice(&list_len.to_be_bytes());
+    extensions.push(0x00); // host_name
+    let name_len = sni_bytes.len() as u16;
+    extensions.extend_from_slice(&name_len.to_be_bytes());
+    extensions.extend_from_slice(sni_bytes);
+
+    // supported_versions + signature_algorithms kept tiny via cipher-only hello body
+    // ClientHello body: version(2) + random(32) + session_id_len(1) + cipher_len(2)
+    // + ciphers + comp_len(1) + comp + ext_len(2) + extensions
+    let mut body = Vec::with_capacity(50 + extensions.len());
+    body.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0); // session id length
+    // A few common suites so modern endpoints still reply (handshake or alert).
+    let ciphers: &[u8] = &[
+        0x13, 0x01, // TLS_AES_128_GCM_SHA256
+        0xc0, 0x2f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        0x00, 0x2f, // TLS_RSA_WITH_AES_128_CBC_SHA
+    ];
+    body.extend_from_slice(&((ciphers.len() as u16).to_be_bytes()));
+    body.extend_from_slice(ciphers);
+    body.push(1); // compression methods length
+    body.push(0); // null compression
+    let ext_len = extensions.len() as u16;
+    body.extend_from_slice(&ext_len.to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::with_capacity(4 + body.len());
+    handshake.push(0x01); // ClientHello
+    let hs_len = body.len() as u32;
+    handshake.push(((hs_len >> 16) & 0xff) as u8);
+    handshake.push(((hs_len >> 8) & 0xff) as u8);
+    handshake.push((hs_len & 0xff) as u8);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::with_capacity(5 + handshake.len());
+    record.push(0x16); // Handshake
+    record.extend_from_slice(&[0x03, 0x01]); // record version TLS 1.0
+    let rec_len = handshake.len() as u16;
+    record.extend_from_slice(&rec_len.to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
+}
+
 /// Retry [`probe_upstream`] until success, deadline, or optional hard failure.
 ///
 /// Returns `Ok(true)` when the upstream answered, `Ok(false)` when soft-failing
@@ -188,7 +355,7 @@ pub async fn ensure_upstream_ready(
 async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) -> Result<()> {
     match proxy {
         UpstreamProxy::Direct => {
-            info!("Upstream proxy: direct (no probe)");
+            debug!("Upstream proxy: direct (no probe)");
             Ok(())
         }
         UpstreamProxy::Socks5 { host, port, username, password: _ } => {
@@ -206,7 +373,7 @@ async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) 
                 )
             })?;
 
-            info!("Connected to SOCKS5 proxy {host}:{port}; waiting for SOCKS5 greeting response");
+            debug!("Connected to SOCKS5 proxy {host}:{port}; waiting for SOCKS5 greeting response");
             let auth_method: u8 = if username.is_some() { 0x02 } else { 0x00 };
             stream.write_all(&[0x05, 0x01, auth_method]).await?;
             let mut resp = [0u8; 2];
@@ -220,7 +387,7 @@ async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) 
             if resp[1] == 0xff {
                 bail!("SOCKS5 probe: proxy rejected all auth methods");
             }
-            info!(
+            debug!(
                 "SOCKS5 proxy at {host}:{port} is reachable (selected auth 0x{:02x})",
                 resp[1]
             );
@@ -231,7 +398,7 @@ async fn probe_upstream_inner(proxy: &UpstreamProxy, connect_timeout: Duration) 
                 .await
                 .with_context(|| format!("timed out connecting to HTTP proxy {host}:{port}"))?
                 .with_context(|| format!("cannot reach HTTP proxy at {host}:{port}"))?;
-            info!("HTTP proxy at {host}:{port} is reachable");
+            debug!("HTTP proxy at {host}:{port} is reachable");
             Ok(())
         }
     }
